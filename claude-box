@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# claude-box — run the Claude Code CLI inside a container sandbox, one box per
+# task, with a fan-out driver for parallel headless runs.
+#
+#   ./claude-box build                      Build (or rebuild) the image
+#   ./claude-box                            Run `claude` on the CURRENT directory
+#   ./claude-box <dir>                      Run `claude` on <dir>
+#   ./claude-box [<dir>] <args>             Pass args to claude (--resume, --model …)
+#   ./claude-box [<dir>] shell              Drop into a bash shell inside the sandbox
+#   ./claude-box run -n N [<dir>] <prompt>  Fan out N headless boxes over N worktrees
+#   ./claude-box ps                         List running boxes
+#   ./claude-box logs [-f] <box>            Show one box's log
+#   ./claude-box results <run-id>           Exit code, branch and diffstat per box
+#   ./claude-box cleanup <run-id>           Remove that run's worktrees and branches
+#   ./claude-box stop <box>|--all           Stop one box, or every box
+#   ./claude-box stop --daemon              Stop the container daemon/VM itself
+#
+# ENGINE: Docker and Apple `container` are both supported and auto-detected,
+# Docker first. Force one with CLAUDE_BOX_ENGINE=docker|container. The two CLIs
+# are close but not compatible — `-c` means --cpus on Apple `container` and
+# --cpu-shares on Docker, and Docker Desktop cannot bind-mount the host's SSH
+# agent socket directly (it exposes it at a fixed magic path instead) — so every
+# such difference is funnelled through the engine_* helpers below.
+#
+# The target dir defaults to $PWD. If the FIRST argument is an existing
+# directory, it is used instead and dropped from the args given to claude.
+#
+# Mount vs. working dir: if the target is under $HOME/workspace, the WHOLE
+# workspace root is mounted at ~/workspace (so sibling dirs like repos/ stay
+# reachable) and claude's working dir is set to the target's subpath — this is
+# what lets a project's .claude/agents load while keeping the clones available.
+# A target outside $HOME/workspace is mounted directly at ~/workspace as before.
+# The mount lands at the SAME path relative to $HOME on both sides; /workspace
+# remains a symlink to it so existing absolute paths keep working.
+#
+# Auth is DECOUPLED + PERSISTENT: credentials live in $CONFIG_HOME on the host
+# and are bind-mounted in, so you log in once and never again. The host Keychain
+# and any Claude Code agents running outside the container are never touched.
+set -euo pipefail
+
+IMAGE="${CLAUDE_BOX_IMAGE:-claude-box:latest}"
+# Build context = this script's own dir, so the repo stays relocatable.
+SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Persistent, sandbox-only ~/.claude (creds+config), in the macOS app-data dir.
+CONFIG_HOME="$HOME/Library/Application Support/claude-box"
+# Runner-owned state — box config dirs, logs, run metadata, the pnpm global dir
+# and out-of-workspace pnpm store. Deliberately a SIBLING of $CONFIG_HOME, not a
+# subdir: $CONFIG_HOME is bind-mounted into the box, and the box has no business
+# seeing (or writing to) other boxes' state.
+STATE_HOME="${CLAUDE_BOX_STATE:-$HOME/Library/Application Support/claude-box-state}"
+NAME_PREFIX="claude-box-"
+
+die() { echo "claude-box: $*" >&2; exit 1; }
+note() { echo "claude-box: $*" >&2; }
+
+# --- engine detection and per-engine differences ------------------------------
+ENGINE=""
+detect_engine() {
+  case "${CLAUDE_BOX_ENGINE:-auto}" in
+    docker|container)
+      ENGINE="$CLAUDE_BOX_ENGINE"
+      command -v "$ENGINE" >/dev/null 2>&1 \
+        || die "CLAUDE_BOX_ENGINE=$ENGINE but the '$ENGINE' CLI is not on PATH"
+      ;;
+    auto)
+      if command -v docker >/dev/null 2>&1; then ENGINE=docker
+      elif command -v container >/dev/null 2>&1; then ENGINE=container
+      else die "no container engine found — install Docker or the Apple 'container' CLI"
+      fi
+      ;;
+    *) die "CLAUDE_BOX_ENGINE must be docker, container or auto" ;;
+  esac
+}
+
+# Apple `container` puts the sandbox on a vmnet subnet (192.168.64.0/24) behind
+# bridge100; reaching the internet needs the HOST to forward those packets out
+# en0. A VPN (e.g. AWS Client VPN) zeroes net.inet.ip.forwarding on connect as an
+# anti-IP-leak measure and does NOT restore it on disconnect — so the container
+# silently loses egress (DNS still resolves locally, so it looks like a hang at
+# "Checking connectivity…" / endless API retries). Re-enable it when off. We only
+# touch sudo in the broken case, so the common path stays prompt-free.
+# Docker Desktop NATs through its own VM and needs none of this.
+ensure_ip_forwarding() {
+  if [ "$(sysctl -n net.inet.ip.forwarding 2>/dev/null || echo 1)" = "0" ]; then
+    note "host IP forwarding is off (VPN?) — re-enabling for container egress…"
+    sudo sysctl -w net.inet.ip.forwarding=1 >/dev/null
+  fi
+}
+
+ensure_daemon() {
+  case "$ENGINE" in
+    docker)
+      docker info >/dev/null 2>&1 && return 0
+      if [ -d /Applications/Docker.app ]; then
+        note "starting Docker Desktop…"
+        open -a Docker
+        local i
+        for i in $(seq 1 60); do
+          docker info >/dev/null 2>&1 && return 0
+          sleep 2
+        done
+      fi
+      die "the Docker daemon is not reachable (\`docker info\` fails)"
+      ;;
+    container)
+      if ! container ls >/dev/null 2>&1; then
+        note "starting the Apple container daemon…"
+        container system start
+      fi
+      ensure_ip_forwarding
+      ;;
+  esac
+}
+
+# CPU limit. Docker's `-c` is --cpu-shares (a *relative weight*, not a cap), so
+# using it there would silently drop the limit.
+engine_cpu_args() {
+  case "$ENGINE" in
+    docker)    printf '%s\n' --cpus "$CLAUDE_BOX_CPUS" ;;
+    container) printf '%s\n' -c "$CLAUDE_BOX_CPUS" ;;
+  esac
+}
+
+# SSH agent. Docker Desktop's VM cannot see a host unix socket through a normal
+# bind mount; it re-exports the host agent inside the VM at a fixed path.
+engine_ssh_args() {
+  [ -n "${SSH_AUTH_SOCK:-}" ] || return 0
+  case "$ENGINE" in
+    docker)    printf '%s\n' -v /run/host-services/ssh-auth.sock:/ssh-agent.sock ;;
+    container) [ -S "$SSH_AUTH_SOCK" ] && printf '%s\n' -v "$SSH_AUTH_SOCK:/ssh-agent.sock" ;;
+  esac
+}
+
+engine_build() {
+  case "$ENGINE" in
+    docker)    docker build -t "$IMAGE" "$SETUP_DIR" ;;
+    container) container build -t "$IMAGE" "$SETUP_DIR" ;;
+  esac
+}
+
+# Names of running boxes, one per line.
+engine_running_boxes() {
+  case "$ENGINE" in
+    docker)
+      docker ps --filter "name=^/${NAME_PREFIX}" --format '{{.Names}}' 2>/dev/null || true
+      ;;
+    container)
+      # `container ls` has no name filter; take the first whitespace field.
+      container ls 2>/dev/null | awk '{print $1}' | grep "^${NAME_PREFIX}" || true
+      ;;
+  esac
+}
+
+engine_stop_box() {
+  case "$ENGINE" in
+    docker)    docker stop "$1" >/dev/null ;;
+    container) container stop "$1" >/dev/null ;;
+  esac
+}
+
+engine_stop_daemon() {
+  case "$ENGINE" in
+    docker)    osascript -e 'quit app "Docker"' ;;
+    container) container system stop ;;
+  esac
+}
+
+box_is_running() {
+  engine_running_boxes | grep -qx "$1"
+}
+
+# --- VM sizing ----------------------------------------------------------------
+# Each background agent is another full Claude Code (Node) process plus the tools
+# it spawns, so parallel agent fan-out multiplies memory/CPU use. The old 4G cap
+# let a few concurrent agents exhaust the VM's RAM (no swap → OOM kill, or
+# thrashing) which presents as a freeze. Defaults are derived from the host and
+# overridable via env; `run -n N` additionally divides a memory BUDGET across the
+# N boxes, because N boxes at the single-box default would oversubscribe the host.
+host_mem_gib() {
+  local bytes
+  bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+  [ "$bytes" -gt 0 ] 2>/dev/null && echo $((bytes / 1024 / 1024 / 1024)) || echo 8
+}
+host_cpus() { sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+
+MEM_EXPLICIT=0; [ -n "${CLAUDE_BOX_MEM:-}" ] && MEM_EXPLICIT=1
+CPUS_EXPLICIT=0; [ -n "${CLAUDE_BOX_CPUS:-}" ] && CPUS_EXPLICIT=1
+HOST_GIB="$(host_mem_gib)"
+# Single box: 8 GiB, or a quarter of the host when that is smaller.
+DEFAULT_MEM_GIB=8
+[ $((HOST_GIB / 4)) -lt "$DEFAULT_MEM_GIB" ] && DEFAULT_MEM_GIB=$((HOST_GIB / 4))
+[ "$DEFAULT_MEM_GIB" -lt 2 ] && DEFAULT_MEM_GIB=2
+CLAUDE_BOX_MEM="${CLAUDE_BOX_MEM:-${DEFAULT_MEM_GIB}G}"
+CLAUDE_BOX_CPUS="${CLAUDE_BOX_CPUS:-4}"
+# Share of host RAM a fan-out may claim in total. The rest is left for the host,
+# Docker Desktop's own VM overhead, and whatever else is running.
+CLAUDE_BOX_FANOUT_MEM_PCT="${CLAUDE_BOX_FANOUT_MEM_PCT:-60}"
+CLAUDE_BOX_MIN_BOX_GIB="${CLAUDE_BOX_MIN_BOX_GIB:-3}"
+
+# Sets CLAUDE_BOX_MEM / CLAUDE_BOX_CPUS for one member of an N-box fan-out.
+# An explicit env value always wins — this only fills in the default.
+size_for_fanout() {
+  local n="$1" budget per_box per_cpu
+  if [ "$MEM_EXPLICIT" = "0" ]; then
+    budget=$((HOST_GIB * CLAUDE_BOX_FANOUT_MEM_PCT / 100))
+    per_box=$((budget / n))
+    [ "$per_box" -gt "$DEFAULT_MEM_GIB" ] && per_box="$DEFAULT_MEM_GIB"
+    if [ "$per_box" -lt "$CLAUDE_BOX_MIN_BOX_GIB" ]; then
+      die "$n boxes × ${CLAUDE_BOX_MIN_BOX_GIB}G exceeds the ${CLAUDE_BOX_FANOUT_MEM_PCT}% memory budget of a ${HOST_GIB}G host — lower -n (max $((budget / CLAUDE_BOX_MIN_BOX_GIB))), or set CLAUDE_BOX_MEM to override the guard"
+    fi
+    CLAUDE_BOX_MEM="${per_box}G"
+  fi
+  if [ "$CPUS_EXPLICIT" = "0" ]; then
+    per_cpu=$(( $(host_cpus) / n ))
+    [ "$per_cpu" -lt 1 ] && per_cpu=1
+    [ "$per_cpu" -gt 4 ] && per_cpu=4
+    CLAUDE_BOX_CPUS="$per_cpu"
+  fi
+}
+
+# --- target dir → mount root + working dir ------------------------------------
+# Where the workspace lands INSIDE the container. The container runs as root, so
+# this is ~/workspace on both sides: a path is the same relative to $HOME on the
+# host and in the sandbox, and `~/workspace/repos/<x>` resolves in either.
+# The image also symlinks /workspace -> here, so absolute /workspace/... paths
+# baked into git worktrees, agent definitions and docs keep resolving.
+CONTAINER_WS="/root/workspace"
+TARGET="" MOUNT_SRC="" WORKDIR="" WS_ROOT=""
+
+# Decouple the MOUNT ROOT from the in-container WORKING DIR.
+# The multi-repo workspace root ($HOME/workspace) holds sibling dirs that
+# reference one another, and a project only loads its .claude/agents when claude
+# starts *inside* that dir. So if TARGET is anywhere under the workspace root,
+# mount the WHOLE root at $CONTAINER_WS (siblings stay reachable) but set -w to
+# TARGET's subpath. Outside the root, mount TARGET itself at $CONTAINER_WS.
+resolve_target() {
+  TARGET="${1:-$PWD}"
+  TARGET="$(cd "$TARGET" && pwd -P)"
+  WS_ROOT="$(cd "$HOME/workspace" 2>/dev/null && pwd -P || true)"
+  if [ -n "$WS_ROOT" ] && { [ "$TARGET" = "$WS_ROOT" ] || [ "${TARGET#"$WS_ROOT"/}" != "$TARGET" ]; }; then
+    MOUNT_SRC="$WS_ROOT"
+    local rel="${TARGET#"$WS_ROOT"}"   # "" when TARGET == root, else "/<subpath>"
+    WORKDIR="$CONTAINER_WS$rel"
+  else
+    MOUNT_SRC="$TARGET"
+    WORKDIR="$CONTAINER_WS"
+  fi
+}
+
+# host path under the mount root → the path the container sees
+to_container_path() {
+  local p="$1"
+  printf '%s\n' "$CONTAINER_WS${p#"$MOUNT_SRC"}"
+}
+
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-24; }
+
+# --- per-box ~/.claude --------------------------------------------------------
+# One shared $CONFIG_HOME was fine for a single interactive box, but N boxes
+# writing the same history.jsonl / projects/ / todos/ / shell-snapshots/ clobber
+# each other. So: every box gets its OWN config dir, seeded from the shared one,
+# and the shared CREDENTIALS FILE is bind-mounted over the top — you still log in
+# once, a refreshed token still lands in the shared file, but session state stops
+# colliding. The plain interactive box keeps the whole shared dir (so --resume and
+# history work as before) unless another box already holds it.
+CONFIG_ARGS=()
+ISOLATED_CFG=""
+
+seed_config() {
+  local dst="$1" item
+  mkdir -p "$dst"
+  # Config the box should inherit. Session state (projects/, todos/, history,
+  # shell-snapshots/, statsig/) is deliberately NOT copied — that is the state
+  # whose sharing caused the collisions.
+  for item in settings.json CLAUDE.md plugins agents commands skills; do
+    [ -e "$CONFIG_HOME/$item" ] || continue
+    [ -e "$dst/$item" ] && continue
+    cp -R "$CONFIG_HOME/$item" "$dst/$item" 2>/dev/null || true
+  done
+}
+
+# $1 = box name, $2 = "isolated" | "shared" | "none"
+resolve_config_mount() {
+  local name="$1" mode="$2" owner
+  # "none" is for short-lived housekeeping boxes that never run `claude`.
+  if [ "$mode" = none ]; then
+    CONFIG_ARGS=()
+    return 0
+  fi
+  if [ "$mode" = shared ]; then
+    owner="$(cat "$STATE_HOME/shared-owner" 2>/dev/null || true)"
+    if [ -n "$owner" ] && box_is_running "$owner"; then
+      note "box '$owner' already holds the shared config — giving this one its own (history/--resume will be separate)"
+      mode=isolated
+    else
+      printf '%s\n' "$name" > "$STATE_HOME/shared-owner"
+    fi
+  fi
+  if [ "$mode" = shared ]; then
+    CONFIG_ARGS=(-v "$CONFIG_HOME:/root/.claude")
+    return 0
+  fi
+  ISOLATED_CFG="$STATE_HOME/boxes/$name/claude"
+  seed_config "$ISOLATED_CFG"
+  CONFIG_ARGS=(-v "$ISOLATED_CFG:/root/.claude")
+  # Nested file mount: the shared credentials land inside the per-box dir, so a
+  # token refresh in any box is visible to all of them and to the next one.
+  if [ -f "$CONFIG_HOME/.credentials.json" ]; then
+    CONFIG_ARGS+=(-v "$CONFIG_HOME/.credentials.json:/root/.claude/.credentials.json")
+  else
+    note "no login found in $CONFIG_HOME — run './claude-box' once and /login before using isolated or headless boxes"
+  fi
+}
+
+# --- run args: auth, identity, caches -----------------------------------------
+# Auth wiring reuses the HOST session; nothing is created or copied in.
+RUN_ARGS=()
+
+build_run_args() {
+  local name="$1" cfg_mode="$2"
+  RUN_ARGS=(--name "$name" -m "$CLAUDE_BOX_MEM")
+  local a
+  while IFS= read -r a; do [ -n "$a" ] && RUN_ARGS+=("$a"); done < <(engine_cpu_args)
+
+  resolve_config_mount "$name" "$cfg_mode"
+  RUN_ARGS+=("${CONFIG_ARGS[@]}")
+
+  # GitHub CLI: the host token lives in the macOS Keychain, which the Linux VM
+  # can't read — so a config bind-mount won't carry it. Instead read the EXISTING
+  # session token via `gh auth token` (this creates NO new token) and pass it in.
+  # An explicitly-exported GH_TOKEN/GITHUB_TOKEN takes precedence.
+  local gh_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  if [ -z "$gh_token" ] && command -v gh >/dev/null 2>&1; then
+    gh_token="$(gh auth token 2>/dev/null || true)"
+  fi
+  [ -n "$gh_token" ] && RUN_ARGS+=(-e "GH_TOKEN=$gh_token")
+
+  # Private npm registry (GitHub Packages): pnpm install authenticates via a token
+  # that a project/.npmrc references as ${GITHUB_REGISTRY_ACCESS_TOKEN}. Forward
+  # the host's value so the substitution resolves. Never created here.
+  [ -n "${GITHUB_REGISTRY_ACCESS_TOKEN:-}" ] && \
+    RUN_ARGS+=(-e "GITHUB_REGISTRY_ACCESS_TOKEN=$GITHUB_REGISTRY_ACCESS_TOKEN")
+
+  # An API key, when the box is driven headlessly by something that has one.
+  [ -n "${ANTHROPIC_API_KEY:-}" ] && RUN_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+
+  # SSH: forward the host agent so signing happens on the host and private keys
+  # NEVER enter the sandbox. known_hosts is mounted read-only so host-key
+  # verification doesn't prompt. No id_* keys are exposed.
+  while IFS= read -r a; do [ -n "$a" ] && RUN_ARGS+=("$a"); done < <(engine_ssh_args)
+  [ -n "${SSH_AUTH_SOCK:-}" ] && RUN_ARGS+=(-e "SSH_AUTH_SOCK=/ssh-agent.sock")
+  [ -f "$HOME/.ssh/known_hosts" ] && \
+    RUN_ARGS+=(-v "$HOME/.ssh/known_hosts:/root/.ssh/known_hosts:ro")
+
+  # Git identity. The host ~/.gitconfig is NOT mounted (it is full of macOS-only
+  # paths and credential helpers), which used to leave the box with no identity at
+  # all — so commits made in the box failed or landed unattributed. Pass just the
+  # identity through, as env, where per-repo config still overrides it.
+  local git_name git_email
+  git_name="${GIT_AUTHOR_NAME:-$(git config --get user.name 2>/dev/null || true)}"
+  git_email="${GIT_AUTHOR_EMAIL:-$(git config --get user.email 2>/dev/null || true)}"
+  if [ -n "$git_name" ] && [ -n "$git_email" ]; then
+    RUN_ARGS+=(-e "GIT_AUTHOR_NAME=$git_name"    -e "GIT_COMMITTER_NAME=$git_name"
+               -e "GIT_AUTHOR_EMAIL=$git_email"  -e "GIT_COMMITTER_EMAIL=$git_email")
+  fi
+
+  # Timezone: the image is UTC, the host usually isn't, and an agent that reasons
+  # about "today" or reads timestamps should agree with the human next to it.
+  local tz="${TZ:-}"
+  [ -z "$tz" ] && [ -L /etc/localtime ] && \
+    tz="$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')"
+  [ -n "$tz" ] && RUN_ARGS+=(-e "TZ=$tz")
+
+  # Forward the update opt-out and TTL to the entrypoint (a fresh env, not the
+  # host's). Only passed when set on the host.
+  [ -n "${CLAUDE_BOX_SKIP_UPDATE:-}" ] && \
+    RUN_ARGS+=(-e "CLAUDE_BOX_SKIP_UPDATE=$CLAUDE_BOX_SKIP_UPDATE")
+  [ -n "${CLAUDE_BOX_UPDATE_TTL:-}" ] && \
+    RUN_ARGS+=(-e "CLAUDE_BOX_UPDATE_TTL=$CLAUDE_BOX_UPDATE_TTL")
+
+  # pnpm global dir, persisted. Without this, the start-time `pnpm add -g
+  # claude-code@latest` re-installs on every single start and throws the result
+  # away with the --rm container — N times over for an N-box fan-out. This mount
+  # is FIRST on PATH in the image, so the baseline install baked into the image
+  # stays as the offline fallback underneath it.
+  mkdir -p "$STATE_HOME/pnpm-global"
+  RUN_ARGS+=(-v "$STATE_HOME/pnpm-global:/root/pnpm-global")
+
+  # pnpm store. The image points store-dir at $CONTAINER_WS/.pnpm-store so the
+  # store sits on the same (bind-mounted) filesystem as node_modules and pnpm can
+  # hardlink instead of copy. That is right for the ~/workspace root, but for a
+  # target OUTSIDE it that would drop a .pnpm-store into the user's own project
+  # dir — so those boxes get a shared store from the runner's state dir instead
+  # (a separate mount, so pnpm copies rather than links).
+  if [ -z "$WS_ROOT" ] || [ "$MOUNT_SRC" != "$WS_ROOT" ]; then
+    mkdir -p "$STATE_HOME/pnpm-store"
+    RUN_ARGS+=(-v "$STATE_HOME/pnpm-store:/root/.pnpm-store"
+               -e "CLAUDE_BOX_STORE_DIR=/root/.pnpm-store")
+  fi
+
+  RUN_ARGS+=(-v "$MOUNT_SRC:$CONTAINER_WS" -w "$WORKDIR")
+}
+
+# Interactive box in the foreground. Only asks for a TTY when it actually has
+# one, so the runner also works from cron, CI or a parent agent.
+run_box_fg() {
+  local name="$1" cfg_mode="$2"; shift 2
+  build_run_args "$name" "$cfg_mode"
+  local tty_args=(-i)
+  [ -t 0 ] && [ -t 1 ] && tty_args=(-it)
+  exec "$ENGINE" run --rm "${tty_args[@]}" "${RUN_ARGS[@]}" "$IMAGE" "$@"
+}
+
+# Detached box: no TTY, output to a log file, exit code recorded on completion.
+# Backgrounded here rather than with the engine's own --detach so `logs`,
+# `results` and cleanup behave identically on Docker and Apple `container`.
+run_box_bg() {
+  local name="$1" cfg_mode="$2" log="$3" exit_file="$4"; shift 4
+  build_run_args "$name" "$cfg_mode"
+  mkdir -p "$(dirname "$log")" "$(dirname "$exit_file")"
+  rm -f "$exit_file"
+  nohup bash -c '
+    "$1" run --rm "${@:5}" >"$2" 2>&1
+    echo $? >"$3"
+  ' _ "$ENGINE" "$log" "$exit_file" _ "${RUN_ARGS[@]}" "$IMAGE" "$@" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# One short-lived box for a housekeeping command (worktree add/remove, diffstat).
+# Runs in the container so any path it writes into git metadata is a CONTAINER
+# path: git worktree admin files store absolute paths, and the host's
+# /Users/<you>/workspace/... does not exist inside the box.
+box_exec() {
+  local script="$1"
+  build_run_args "${NAME_PREFIX}exec-$$" none
+  "$ENGINE" run --rm -e CLAUDE_BOX_SKIP_UPDATE=1 "${RUN_ARGS[@]}" "$IMAGE" bash -lc "$script"
+}

@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Editor cruft
+*.swp
+*~
+
+# Local private scope→registry mappings (see registries.npmrc.example)
+registries.npmrc

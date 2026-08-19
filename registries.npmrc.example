@@ -1,0 +1,13 @@
+# claude-box — private scope→registry mappings (OPTIONAL)
+#
+# Copy this file to `registries.npmrc` (gitignored) and add one line per private
+# scope you use. At `./claude-box build` these lines are appended to the image's
+# user-level ~/.npmrc, so pnpm/npm resolve those scopes to the private registry.
+#
+# The matching auth token line
+#   //npm.pkg.github.com/:_authToken=${GITHUB_REGISTRY_ACCESS_TOKEN}
+# is already baked into the image and resolved at runtime from the env var the
+# runner forwards, so you only need the scope mapping(s) here.
+#
+# Example — route an org scope to GitHub Packages:
+#@my-org:registry=https://npm.pkg.github.com/
