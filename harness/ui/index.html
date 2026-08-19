@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-box harness</title>
+<style>
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --panel-2: #f2f4f7; --line: #e3e6ea;
+  --ink: #16191d; --ink-2: #5b6472; --ink-3: #8a93a1;
+  --accent: #2f6feb; --ok: #1f8a4c; --warn: #b7791f; --bad: #c0392b; --idle: #8a93a1;
+  --radius: 12px; --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216; --panel: #161a20; --panel-2: #1c222a; --line: #262d37;
+    --ink: #e7ebf0; --ink-2: #a3adbb; --ink-3: #6f7a89;
+    --accent: #5c93ff; --ok: #3fbd6f; --warn: #e0a83c; --bad: #ef6a5c;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+header {
+  position: sticky; top: 0; z-index: 10; backdrop-filter: blur(10px);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  border-bottom: 1px solid var(--line); padding: 14px 20px;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+h1 span { color: var(--ink-3); font-weight: 450; }
+main { padding: 20px; max-width: 1500px; margin: 0 auto; }
+section { margin-bottom: 28px; }
+h2 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--ink-3); margin: 0 0 10px; font-weight: 650;
+}
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+  border-radius: 999px; background: var(--panel); border: 1px solid var(--line);
+  font-size: 12px; color: var(--ink-2); white-space: nowrap;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--idle); flex: none; }
+.dot.live { background: var(--ok); animation: pulse 1.8s ease-in-out infinite; }
+.dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+.spacer { flex: 1 1 auto; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px; transition: border-color .15s ease, transform .15s ease;
+}
+.card.live { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.badge {
+  font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px;
+  background: var(--panel-2); color: var(--ink-2); white-space: nowrap;
+}
+.badge.pm    { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.badge.dev   { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+.badge.qa    { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+.badge.other { background: var(--panel-2); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--ink-2); }
+.dim { color: var(--ink-3); }
+.elapsed { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+button {
+  font: inherit; font-size: 12px; padding: 5px 10px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+.board { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.col { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; }
+.col h3 {
+  font-size: 11px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--ink-3); display: flex; justify-content: space-between;
+}
+.task { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 9px 10px; margin-bottom: 8px; }
+.task:last-child { margin-bottom: 0; }
+.task .t { font-weight: 550; font-size: 13px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.chip { font-size: 11px; padding: 2px 7px; border-radius: 5px; background: var(--panel-2); color: var(--ink-2); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); font-weight: 600; padding: 6px 10px; }
+td { padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; }
+tr:hover td { background: var(--panel-2); }
+.scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+.empty { color: var(--ink-3); font-size: 13px; padding: 14px; text-align: center; background: var(--panel); border: 1px dashed var(--line); border-radius: var(--radius); }
+.note { font-size: 12px; color: var(--ink-3); margin-top: 8px; }
+.note code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+#drawer {
+  position: fixed; inset: auto 0 0 0; height: 62vh; background: var(--panel);
+  border-top: 1px solid var(--line); transform: translateY(100%);
+  transition: transform .22s cubic-bezier(.2,.8,.2,1); display: flex; flex-direction: column; z-index: 20;
+}
+#drawer.open { transform: translateY(0); box-shadow: 0 -18px 40px rgba(0,0,0,.18); }
+#drawer header { position: static; background: none; backdrop-filter: none; }
+#logbody { flex: 1; overflow: auto; margin: 0; padding: 14px 20px; font-family: var(--mono); font-size: 12px; line-height: 1.55; white-space: pre-wrap; color: var(--ink-2); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">claude-box harness <span id="slug"></span></h1>
+  <span class="pill" id="lock"><span class="dot"></span><span>lock</span></span>
+  <span class="pill" id="autonomy">–</span>
+  <span class="pill" id="capacity">–</span>
+  <span class="pill" id="lasttick">–</span>
+  <span class="spacer"></span>
+  <span class="pill"><span class="dot live"></span><span id="refreshed">live</span></span>
+</header>
+
+<main>
+  <section>
+    <h2>In flight</h2>
+    <div class="grid" id="boxes"></div>
+  </section>
+
+  <section>
+    <h2>Board</h2>
+    <div class="board" id="board"></div>
+  </section>
+
+  <section>
+    <h2>Pending memory <span class="dim" id="pendingcount"></span></h2>
+    <div class="grid" id="pending"></div>
+    <p class="note">Acceptance is a terminal step, deliberately: run <code>claude-box harness memory</code>. Nothing here is memory yet.</p>
+  </section>
+
+  <section>
+    <h2>Rejected intents</h2>
+    <div class="scroll" id="rejected"></div>
+  </section>
+
+  <section>
+    <h2>Ticks</h2>
+    <div class="scroll" id="ticks"></div>
+  </section>
+</main>
+
+<div id="drawer">
+  <header>
+    <strong class="mono" id="logname">log</strong>
+    <span class="spacer"></span>
+    <button onclick="closeLog()">close</button>
+  </header>
+  <pre id="logbody"></pre>
+</div>
+
+<script>
+const ROLE_CLASS = {
+  "project-manager": "pm", "lead-dev": "dev", "devops": "dev",
+  "software-engineer": "dev", "devops-engineer": "dev",
+  "qa-reviewer": "qa", "cataloguer": "other", "auditor": "other", "oncall-guide": "other",
+};
+const COLUMNS = ["draft", "ready", "in-progress", "in-review", "blocked", "done"];
+let openBox = null, state = null;
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function dur(sec) {
+  if (sec == null) return "–";
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60), h = Math.floor(m / 60);
+  return h ? `${h}h ${m % 60}m` : `${m}m ${sec % 60}s`;
+}
+const ago = (ts) => ts ? dur(Math.max(0, Math.round(Date.now() / 1000 - ts))) + " ago" : "never";
+
+function render(s) {
+  state = s;
+  document.getElementById("slug").textContent = s.instance;
+
+  const lock = document.getElementById("lock");
+  const held = s.lock.held && s.lock.alive;
+  lock.innerHTML = `<span class="dot ${held ? "live" : s.lock.held ? "bad" : ""}"></span><span>${
+    held ? `loop running · pid ${s.lock.pid}` : s.lock.held ? "stale lock" : "loop idle"}</span>`;
+
+  const auto = document.getElementById("autonomy");
+  const modes = {
+    gated:   ["", "gated · you promote, you merge"],
+    promote: ["warn", "promote · the host promotes, without you"],
+    full:    ["bad", "FULL · the host promotes and merges, without you"],
+  };
+  const [cls, label] = modes[s.autonomy] || modes.gated;
+  auto.innerHTML = `<span class="dot ${cls}"></span><span>${label}</span>`;
+
+  document.getElementById("capacity").textContent =
+    `${s.cap.inflight}/${s.cap.declared} boxes in flight`;
+  const latest = s.ticks[0];
+  document.getElementById("lasttick").textContent =
+    latest ? `tick ${latest.id.replace(/^t/, "")} · ${ago(latest.when)}` : "no ticks yet";
+
+  // in flight
+  const boxes = document.getElementById("boxes");
+  boxes.innerHTML = s.boxes.length ? s.boxes.map(b => `
+    <div class="card live">
+      <div class="card-head">
+        <span class="badge ${ROLE_CLASS[b.role] || "other"}">${esc(b.role)}</span>
+        <span class="mono muted">${esc(b.task || "—")}</span>
+        <span class="elapsed" data-started="${b.started || ""}">${dur(b.elapsed)}</span>
+      </div>
+      <div class="mono dim" style="word-break:break-all">${esc(b.name)}</div>
+      <div style="margin-top:10px"><button onclick="showLog('${esc(b.name)}')">log</button></div>
+    </div>`).join("") : `<div class="empty">No boxes running. Start one with <code>claude-box harness tick</code>.</div>`;
+
+  // board
+  const byStatus = {};
+  for (const t of s.tasks) (byStatus[t.status] = byStatus[t.status] || []).push(t);
+  const seen = new Set(COLUMNS);
+  const cols = COLUMNS.concat(Object.keys(byStatus).filter(k => !seen.has(k)));
+  document.getElementById("board").innerHTML = cols.map(col => {
+    const items = byStatus[col] || [];
+    return `<div class="col"><h3><span>${esc(col)}</span><span>${items.length}</span></h3>
+      ${items.map(t => `<div class="task">
+        <div class="t">${esc(t.title || t.id)}</div>
+        <div class="chips">
+          ${t.repo ? `<span class="chip">${esc(t.repo)}</span>` : ""}
+          ${t.assignee ? `<span class="chip">${esc(t.assignee)}</span>` : ""}
+          ${t.pr ? `<span class="chip">PR ${esc(t.pr)}</span>` : ""}
+        </div></div>`).join("") || `<div class="dim" style="font-size:12px">—</div>`}
+    </div>`;
+  }).join("");
+
+  // pending memory
+  document.getElementById("pendingcount").textContent = s.pending.length ? `(${s.pending.length})` : "";
+  document.getElementById("pending").innerHTML = s.pending.length ? s.pending.map(p => `
+    <div class="card">
+      <div class="card-head">
+        <span class="badge ${p.tier === "global" ? "pm" : "dev"}">${esc(p.tier || "no tier")}</span>
+        ${p.repo ? `<span class="chip">${esc(p.repo)}</span>` : ""}
+      </div>
+      <div>${esc(p.body)}</div>
+      <div class="note mono">evidence: ${esc(p.evidence || "—")}</div>
+    </div>`).join("") : `<div class="empty">Nothing proposed yet.</div>`;
+
+  // rejected intents
+  document.getElementById("rejected").innerHTML = s.rejected.length ? `
+    <table><thead><tr><th>role</th><th>task</th><th>why it was refused</th></tr></thead><tbody>
+    ${s.rejected.map(r => `<tr>
+      <td class="mono">${esc(r.role)}</td>
+      <td class="mono dim">${esc(r.task)}</td>
+      <td>${esc(r.reason)}</td></tr>`).join("")}
+    </tbody></table>` : `<div class="empty">No refused dispatches.</div>`;
+
+  // ticks
+  document.getElementById("ticks").innerHTML = s.ticks.length ? `
+    <table><thead><tr><th>tick</th><th>when</th><th>dispatched</th><th>refused</th><th>pending</th><th>violations</th></tr></thead><tbody>
+    ${s.ticks.map(t => `<tr>
+      <td class="mono">${esc(t.id)}</td>
+      <td class="dim">${ago(t.when)}</td>
+      <td>${esc(t.accepted)}</td>
+      <td>${esc(t.rejected)}</td>
+      <td>${esc(t.pending_memory)}</td>
+      <td>${t.violations.length
+        ? `<span class="badge qa">${t.violations.length} reverted</span>`
+        : `<span class="dim">–</span>`}</td></tr>`).join("")}
+    </tbody></table>` : `<div class="empty">No ticks recorded.</div>`;
+
+  document.getElementById("refreshed").textContent = "live · " + new Date().toLocaleTimeString();
+}
+
+async function poll() {
+  try {
+    render(await (await fetch("/api/state")).json());
+  } catch (e) {
+    document.getElementById("refreshed").textContent = "runner unreachable";
+  }
+}
+
+// Elapsed counters tick locally so the cards feel live between polls.
+setInterval(() => {
+  const now = Date.now() / 1000;
+  document.querySelectorAll(".elapsed[data-started]").forEach(el => {
+    const started = parseFloat(el.dataset.started);
+    if (started) el.textContent = dur(Math.max(0, Math.round(now - started)));
+  });
+}, 1000);
+
+async function showLog(name) {
+  openBox = name;
+  document.getElementById("logname").textContent = name;
+  document.getElementById("drawer").classList.add("open");
+  await tailLog();
+}
+async function tailLog() {
+  if (!openBox) return;
+  const body = document.getElementById("logbody");
+  const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
+  try {
+    body.textContent = await (await fetch(`/api/log?box=${encodeURIComponent(openBox)}`)).text();
+  } catch (e) {
+    body.textContent = "log unavailable";
+  }
+  if (atBottom) body.scrollTop = body.scrollHeight;
+}
+function closeLog() {
+  openBox = null;
+  document.getElementById("drawer").classList.remove("open");
+}
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeLog(); });
+
+poll();
+setInterval(poll, 3000);
+setInterval(tailLog, 2000);
+</script>
+</body>
+</html>

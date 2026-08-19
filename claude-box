@@ -15,6 +15,10 @@
 #   ./claude-box stop <box>|--all           Stop one box, or every box
 #   ./claude-box stop --daemon              Stop the container daemon/VM itself
 #
+#   ./claude-box harness tick|loop|status|memory|ui   Role-agent harness (see
+#   ./claude-box role <role> [flags]                  harness/harness.sh and
+#                                                     README "Harness")
+#
 # ENGINE: Docker and Apple `container` are both supported and auto-detected,
 # Docker first. Force one with CLAUDE_BOX_ENGINE=docker|container. The two CLIs
 # are close but not compatible — `-c` means --cpus on Apple `container` and
@@ -25,13 +29,19 @@
 # The target dir defaults to $PWD. If the FIRST argument is an existing
 # directory, it is used instead and dropped from the args given to claude.
 #
-# Mount vs. working dir: if the target is under $HOME/workspace, the WHOLE
-# workspace root is mounted at ~/workspace (so sibling dirs like repos/ stay
-# reachable) and claude's working dir is set to the target's subpath — this is
-# what lets a project's .claude/agents load while keeping the clones available.
-# A target outside $HOME/workspace is mounted directly at ~/workspace as before.
-# The mount lands at the SAME path relative to $HOME on both sides; /workspace
-# remains a symlink to it so existing absolute paths keep working.
+# ROOT: $CLAUDE_BOX_ROOT, default $HOME/Documents/GitHub — the folder your repos
+# live in. It is mounted at the SAME path relative to $HOME inside the box (so
+# /root/Documents/GitHub by default), which is what makes a path identical on
+# both sides: `~/Documents/GitHub/<repo>` resolves in the box and out, git
+# worktree admin paths stay valid, and an `instance.config.json` `reposRoot` of
+# `~/Documents/GitHub` needs no translation. /workspace and /root/workspace stay
+# as compatibility symlinks, created by the entrypoint from CLAUDE_BOX_MOUNT.
+#
+# Mount vs. working dir: if the target is under the root, the WHOLE root is
+# mounted (so sibling repos stay reachable) and claude's working dir is set to
+# the target's subpath — this is what lets a project's .claude/agents load while
+# keeping its sibling clones available. A target outside the root is mounted
+# directly at the same container path instead.
 #
 # Auth is DECOUPLED + PERSISTENT: credentials live in $CONFIG_HOME on the host
 # and are bind-mounted in, so you log in once and never again. The host Keychain
@@ -39,11 +49,23 @@
 set -euo pipefail
 
 IMAGE="${CLAUDE_BOX_IMAGE:-claude-box:latest}"
-# Build context = this script's own dir, so the repo stays relocatable.
-SETUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Build context, harness modules, roles and template all live next to this script, so
+# find where the SCRIPT really is — not where the symlink is. Installing this on PATH
+# (ln -s .../claude-box ~/.local/bin/claude-box) is the normal way to use it, and
+# `dirname "${BASH_SOURCE[0]}"` alone would resolve to ~/.local/bin and lose everything.
+# macOS has no dependable `readlink -f`, hence the loop.
+cb_self="${BASH_SOURCE[0]}"
+while [ -L "$cb_self" ]; do
+  cb_link="$(readlink "$cb_self")"
+  case "$cb_link" in
+    /*) cb_self="$cb_link" ;;
+    *)  cb_self="$(dirname "$cb_self")/$cb_link" ;;
+  esac
+done
+SETUP_DIR="$(cd "$(dirname "$cb_self")" && pwd -P)"
 
 # Persistent, sandbox-only ~/.claude (creds+config), in the macOS app-data dir.
-CONFIG_HOME="$HOME/Library/Application Support/claude-box"
+CONFIG_HOME="${CLAUDE_BOX_CONFIG_HOME:-$HOME/Library/Application Support/claude-box}"
 # Runner-owned state — box config dirs, logs, run metadata, the pnpm global dir
 # and out-of-workspace pnpm store. Deliberately a SIBLING of $CONFIG_HOME, not a
 # subdir: $CONFIG_HOME is bind-mounted into the box, and the box has no business
@@ -55,21 +77,32 @@ die() { echo "claude-box: $*" >&2; exit 1; }
 note() { echo "claude-box: $*" >&2; }
 
 # --- engine detection and per-engine differences ------------------------------
-ENGINE=""
+# ENGINE names the flavour (which flags to use); ENGINE_BIN is what actually gets
+# executed. They differ only for the `fake` engine, which records its arguments
+# instead of launching anything — that is what lets the harness tests cover intent
+# validation, capping, naming and prompt assembly without containers.
+ENGINE="" ENGINE_BIN=""
 detect_engine() {
   case "${CLAUDE_BOX_ENGINE:-auto}" in
     docker|container)
       ENGINE="$CLAUDE_BOX_ENGINE"
       command -v "$ENGINE" >/dev/null 2>&1 \
         || die "CLAUDE_BOX_ENGINE=$ENGINE but the '$ENGINE' CLI is not on PATH"
+      ENGINE_BIN="$ENGINE"
+      ;;
+    fake)
+      ENGINE=fake
+      ENGINE_BIN="${CLAUDE_BOX_FAKE_BIN:-$SETUP_DIR/tests/fake-engine.sh}"
+      [ -x "$ENGINE_BIN" ] || die "fake engine not executable: $ENGINE_BIN"
       ;;
     auto)
       if command -v docker >/dev/null 2>&1; then ENGINE=docker
       elif command -v container >/dev/null 2>&1; then ENGINE=container
       else die "no container engine found — install Docker or the Apple 'container' CLI"
       fi
+      ENGINE_BIN="$ENGINE"
       ;;
-    *) die "CLAUDE_BOX_ENGINE must be docker, container or auto" ;;
+    *) die "CLAUDE_BOX_ENGINE must be docker, container, fake or auto" ;;
   esac
 }
 
@@ -90,6 +123,7 @@ ensure_ip_forwarding() {
 
 ensure_daemon() {
   case "$ENGINE" in
+    fake) return 0 ;;
     docker)
       docker info >/dev/null 2>&1 && return 0
       if [ -d /Applications/Docker.app ]; then
@@ -117,8 +151,8 @@ ensure_daemon() {
 # using it there would silently drop the limit.
 engine_cpu_args() {
   case "$ENGINE" in
-    docker)    printf '%s\n' --cpus "$CLAUDE_BOX_CPUS" ;;
-    container) printf '%s\n' -c "$CLAUDE_BOX_CPUS" ;;
+    docker|fake) printf '%s\n' --cpus "$CLAUDE_BOX_CPUS" ;;
+    container)   printf '%s\n' -c "$CLAUDE_BOX_CPUS" ;;
   esac
 }
 
@@ -127,6 +161,7 @@ engine_cpu_args() {
 engine_ssh_args() {
   [ -n "${SSH_AUTH_SOCK:-}" ] || return 0
   case "$ENGINE" in
+    fake)      return 0 ;;
     docker)    printf '%s\n' -v /run/host-services/ssh-auth.sock:/ssh-agent.sock ;;
     container) [ -S "$SSH_AUTH_SOCK" ] && printf '%s\n' -v "$SSH_AUTH_SOCK:/ssh-agent.sock" ;;
   esac
@@ -136,12 +171,16 @@ engine_build() {
   case "$ENGINE" in
     docker)    docker build -t "$IMAGE" "$SETUP_DIR" ;;
     container) container build -t "$IMAGE" "$SETUP_DIR" ;;
+    fake)      "$ENGINE_BIN" build -t "$IMAGE" "$SETUP_DIR" ;;
   esac
 }
 
 # Names of running boxes, one per line.
 engine_running_boxes() {
   case "$ENGINE" in
+    fake)
+      cat "${CLAUDE_BOX_FAKE_STATE:-/dev/null}/running" 2>/dev/null || true
+      ;;
     docker)
       docker ps --filter "name=^/${NAME_PREFIX}" --format '{{.Names}}' 2>/dev/null || true
       ;;
@@ -156,6 +195,7 @@ engine_stop_box() {
   case "$ENGINE" in
     docker)    docker stop "$1" >/dev/null ;;
     container) container stop "$1" >/dev/null ;;
+    fake)      "$ENGINE_BIN" stop "$1" >/dev/null ;;
   esac
 }
 
@@ -163,6 +203,7 @@ engine_stop_daemon() {
   case "$ENGINE" in
     docker)    osascript -e 'quit app "Docker"' ;;
     container) container system stop ;;
+    fake)      : ;;
   esac
 }
 
@@ -220,27 +261,35 @@ size_for_fanout() {
 }
 
 # --- target dir → mount root + working dir ------------------------------------
-# Where the workspace lands INSIDE the container. The container runs as root, so
-# this is ~/workspace on both sides: a path is the same relative to $HOME on the
-# host and in the sandbox, and `~/workspace/repos/<x>` resolves in either.
-# The image also symlinks /workspace -> here, so absolute /workspace/... paths
-# baked into git worktrees, agent definitions and docs keep resolving.
-CONTAINER_WS="/root/workspace"
-TARGET="" MOUNT_SRC="" WORKDIR="" WS_ROOT=""
+# The root that holds your repos, and where it lands INSIDE the container. The
+# container runs as root, so keeping the path identical relative to $HOME means
+# `~/Documents/GitHub/<repo>` resolves on both sides. A root outside $HOME has no
+# such mapping, so it falls back to /root/workspace.
+CLAUDE_BOX_ROOT="${CLAUDE_BOX_ROOT:-$HOME/Documents/GitHub}"
+ROOT="$(cd "$CLAUDE_BOX_ROOT" 2>/dev/null && pwd -P || true)"
+# Compare against a RESOLVED home: $HOME is often a symlink (macOS /var -> /private/var,
+# and /home -> elsewhere on some setups) while `pwd -P` above resolved the root, so an
+# unresolved comparison silently loses the parity mapping.
+HOME_REAL="$(cd "$HOME" 2>/dev/null && pwd -P || printf '%s' "$HOME")"
+if [ -n "$ROOT" ] && [ "${ROOT#"$HOME_REAL"/}" != "$ROOT" ]; then
+  CONTAINER_WS="/root/${ROOT#"$HOME_REAL"/}"
+else
+  CONTAINER_WS="/root/workspace"
+fi
+TARGET="" MOUNT_SRC="" WORKDIR=""
 
 # Decouple the MOUNT ROOT from the in-container WORKING DIR.
-# The multi-repo workspace root ($HOME/workspace) holds sibling dirs that
-# reference one another, and a project only loads its .claude/agents when claude
-# starts *inside* that dir. So if TARGET is anywhere under the workspace root,
-# mount the WHOLE root at $CONTAINER_WS (siblings stay reachable) but set -w to
-# TARGET's subpath. Outside the root, mount TARGET itself at $CONTAINER_WS.
+# The root holds sibling repos that reference one another, and a project only
+# loads its .claude/agents when claude starts *inside* that dir. So if TARGET is
+# anywhere under the root, mount the WHOLE root at $CONTAINER_WS (siblings stay
+# reachable) but set -w to TARGET's subpath. Outside the root, mount TARGET
+# itself at $CONTAINER_WS.
 resolve_target() {
   TARGET="${1:-$PWD}"
   TARGET="$(cd "$TARGET" && pwd -P)"
-  WS_ROOT="$(cd "$HOME/workspace" 2>/dev/null && pwd -P || true)"
-  if [ -n "$WS_ROOT" ] && { [ "$TARGET" = "$WS_ROOT" ] || [ "${TARGET#"$WS_ROOT"/}" != "$TARGET" ]; }; then
-    MOUNT_SRC="$WS_ROOT"
-    local rel="${TARGET#"$WS_ROOT"}"   # "" when TARGET == root, else "/<subpath>"
+  if [ -n "$ROOT" ] && { [ "$TARGET" = "$ROOT" ] || [ "${TARGET#"$ROOT"/}" != "$TARGET" ]; }; then
+    MOUNT_SRC="$ROOT"
+    local rel="${TARGET#"$ROOT"}"      # "" when TARGET == root, else "/<subpath>"
     WORKDIR="$CONTAINER_WS$rel"
   else
     MOUNT_SRC="$TARGET"
@@ -273,11 +322,24 @@ seed_config() {
   # Config the box should inherit. Session state (projects/, todos/, history,
   # shell-snapshots/, statsig/) is deliberately NOT copied — that is the state
   # whose sharing caused the collisions.
-  for item in settings.json CLAUDE.md plugins agents commands skills; do
+  #
+  # Neither are plugins, commands or skills, unless you ask: a role box should be
+  # deterministic, and process frameworks are the opposite of that in this context —
+  # they add planning gates a headless box cannot answer, and several of them write
+  # plan/spec documents into whatever repo they are run in. That is pollution in a
+  # product repo. Opt in with CLAUDE_BOX_SEED_PLUGINS=1 when you want them.
+  for item in settings.json CLAUDE.md agents; do
     [ -e "$CONFIG_HOME/$item" ] || continue
     [ -e "$dst/$item" ] && continue
     cp -R "$CONFIG_HOME/$item" "$dst/$item" 2>/dev/null || true
   done
+  if [ "${CLAUDE_BOX_SEED_PLUGINS:-0}" = "1" ]; then
+    for item in plugins commands skills; do
+      [ -e "$CONFIG_HOME/$item" ] || continue
+      [ -e "$dst/$item" ] && continue
+      cp -R "$CONFIG_HOME/$item" "$dst/$item" 2>/dev/null || true
+    done
+  fi
 }
 
 # $1 = box name, $2 = "isolated" | "shared" | "none"
@@ -304,18 +366,28 @@ resolve_config_mount() {
   ISOLATED_CFG="$STATE_HOME/boxes/$name/claude"
   seed_config "$ISOLATED_CFG"
   CONFIG_ARGS=(-v "$ISOLATED_CFG:/root/.claude")
-  # Nested file mount: the shared credentials land inside the per-box dir, so a
-  # token refresh in any box is visible to all of them and to the next one.
+  # Auth sharing, without sharing session state.
+  #
+  # The obvious approach — bind-mount the shared .credentials.json ONTO a path inside the
+  # per-box config mount — cannot work: Docker Desktop refuses to create a mountpoint
+  # inside a virtiofs bind mount ("is outside of rootfs"), so every box died at start with
+  # exit 125 the moment a credentials file existed to mount. Instead mount the shared dir
+  # at its own path and let the entrypoint link the one file that must be shared.
+  #   .credentials.json — symlinked, so a token refresh propagates
+  #   .claude.json      — copied, because Claude Code rewrites it constantly and parallel
+  #                       boxes sharing it is the collision this isolation exists to avoid
   if [ -f "$CONFIG_HOME/.credentials.json" ]; then
-    CONFIG_ARGS+=(-v "$CONFIG_HOME/.credentials.json:/root/.claude/.credentials.json")
+    CONFIG_ARGS+=(-v "$CONFIG_HOME:/root/.claude-host")
   else
-    note "no login found in $CONFIG_HOME — run './claude-box' once and /login before using isolated or headless boxes"
+    note "no login found in $CONFIG_HOME — run 'claude-box' once and /login before using isolated or headless boxes"
   fi
 }
 
 # --- run args: auth, identity, caches -----------------------------------------
 # Auth wiring reuses the HOST session; nothing is created or copied in.
 RUN_ARGS=()
+# Extra engine flags a caller wants on top (see cmd_run's IS_SANDBOX note).
+EXTRA_RUN_ARGS=()
 
 build_run_args() {
   local name="$1" cfg_mode="$2"
@@ -324,7 +396,9 @@ build_run_args() {
   while IFS= read -r a; do [ -n "$a" ] && RUN_ARGS+=("$a"); done < <(engine_cpu_args)
 
   resolve_config_mount "$name" "$cfg_mode"
-  RUN_ARGS+=("${CONFIG_ARGS[@]}")
+  # Empty-array-safe: a housekeeping box mounts no config at all, and bash 3.2
+  # treats "${empty[@]}" as an unbound variable under set -u.
+  RUN_ARGS+=(${CONFIG_ARGS[@]+"${CONFIG_ARGS[@]}"})
 
   # GitHub CLI: the host token lives in the macOS Keychain, which the Linux VM
   # can't read — so a config bind-mount won't carry it. Instead read the EXISTING
@@ -341,6 +415,14 @@ build_run_args() {
   # the host's value so the substitution resolves. Never created here.
   [ -n "${GITHUB_REGISTRY_ACCESS_TOKEN:-}" ] && \
     RUN_ARGS+=(-e "GITHUB_REGISTRY_ACCESS_TOKEN=$GITHUB_REGISTRY_ACCESS_TOKEN")
+
+  # Your HOST ~/.claude plugins, read-only, on request. Off by default: the host config
+  # is not the box's, that decoupling is the point of $CONFIG_HOME, and a plugin written
+  # for an interactive session can drag planning gates and plan-document writing into a
+  # headless role box. Turn it on when you specifically want a host skill in the box.
+  if [ "${CLAUDE_BOX_HOST_PLUGINS:-0}" = "1" ] && [ -d "$HOME/.claude/plugins" ]; then
+    RUN_ARGS+=(-v "$HOME/.claude/plugins:/root/.claude/plugins:ro")
+  fi
 
   # An API key, when the box is driven headlessly by something that has one.
   [ -n "${ANTHROPIC_API_KEY:-}" ] && RUN_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
@@ -387,18 +469,25 @@ build_run_args() {
   mkdir -p "$STATE_HOME/pnpm-global"
   RUN_ARGS+=(-v "$STATE_HOME/pnpm-global:/root/pnpm-global")
 
-  # pnpm store. The image points store-dir at $CONTAINER_WS/.pnpm-store so the
-  # store sits on the same (bind-mounted) filesystem as node_modules and pnpm can
-  # hardlink instead of copy. That is right for the ~/workspace root, but for a
-  # target OUTSIDE it that would drop a .pnpm-store into the user's own project
-  # dir — so those boxes get a shared store from the runner's state dir instead
-  # (a separate mount, so pnpm copies rather than links).
-  if [ -z "$WS_ROOT" ] || [ "$MOUNT_SRC" != "$WS_ROOT" ]; then
+  # The entrypoint needs the mount path to hang the /workspace and /root/workspace
+  # compatibility symlinks off, since the path now follows CLAUDE_BOX_ROOT.
+  RUN_ARGS+=(-e "CLAUDE_BOX_MOUNT=$CONTAINER_WS")
+
+  # pnpm store. When the whole root is mounted, put the store inside it: same
+  # (bind-mounted) filesystem as node_modules, so pnpm hardlinks instead of
+  # copying, and it persists as a real host dir. For a target OUTSIDE the root
+  # that would drop a .pnpm-store into the user's own project dir, so those boxes
+  # get a shared store from the runner's state dir instead (a separate mount, so
+  # pnpm copies rather than links).
+  if [ -n "$ROOT" ] && [ "$MOUNT_SRC" = "$ROOT" ]; then
+    RUN_ARGS+=(-e "CLAUDE_BOX_STORE_DIR=$CONTAINER_WS/.pnpm-store")
+  else
     mkdir -p "$STATE_HOME/pnpm-store"
     RUN_ARGS+=(-v "$STATE_HOME/pnpm-store:/root/.pnpm-store"
                -e "CLAUDE_BOX_STORE_DIR=/root/.pnpm-store")
   fi
 
+  RUN_ARGS+=(${EXTRA_RUN_ARGS[@]+"${EXTRA_RUN_ARGS[@]}"})
   RUN_ARGS+=(-v "$MOUNT_SRC:$CONTAINER_WS" -w "$WORKDIR")
 }
 
@@ -409,7 +498,7 @@ run_box_fg() {
   build_run_args "$name" "$cfg_mode"
   local tty_args=(-i)
   [ -t 0 ] && [ -t 1 ] && tty_args=(-it)
-  exec "$ENGINE" run --rm "${tty_args[@]}" "${RUN_ARGS[@]}" "$IMAGE" "$@"
+  exec "$ENGINE_BIN" run --rm "${tty_args[@]}" "${RUN_ARGS[@]}" "$IMAGE" "$@"
 }
 
 # Detached box: no TTY, output to a log file, exit code recorded on completion.
@@ -423,7 +512,7 @@ run_box_bg() {
   nohup bash -c '
     "$1" run --rm "${@:5}" >"$2" 2>&1
     echo $? >"$3"
-  ' _ "$ENGINE" "$log" "$exit_file" _ "${RUN_ARGS[@]}" "$IMAGE" "$@" >/dev/null 2>&1 &
+  ' _ "$ENGINE_BIN" "$log" "$exit_file" _ "${RUN_ARGS[@]}" "$IMAGE" "$@" >/dev/null 2>&1 &
   disown 2>/dev/null || true
 }
 
@@ -434,5 +523,312 @@ run_box_bg() {
 box_exec() {
   local script="$1"
   build_run_args "${NAME_PREFIX}exec-$$" none
-  "$ENGINE" run --rm -e CLAUDE_BOX_SKIP_UPDATE=1 "${RUN_ARGS[@]}" "$IMAGE" bash -lc "$script"
+  "$ENGINE_BIN" run --rm -e CLAUDE_BOX_SKIP_UPDATE=1 "${RUN_ARGS[@]}" "$IMAGE" bash -lc "$script"
 }
+
+unique_name() {
+  local base="$1" name="$1" i=2
+  while box_is_running "$name"; do name="$base-$i"; i=$((i + 1)); done
+  printf '%s\n' "$name"
+}
+
+usage() {
+  sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
+  exit "${1:-0}"
+}
+
+# --- subcommands --------------------------------------------------------------
+cmd_ps() {
+  local names name log
+  names="$(engine_running_boxes)"
+  [ -z "$names" ] && { echo "no boxes running"; return 0; }
+  printf '%-40s %s\n' BOX LOG
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    log="$STATE_HOME/logs/$name.log"
+    [ -f "$log" ] || log="-  (interactive)"
+    printf '%-40s %s\n' "$name" "$log"
+  done <<< "$names"
+}
+
+cmd_logs() {
+  local follow=0
+  [ "${1:-}" = "-f" ] && { follow=1; shift; }
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: claude-box logs [-f] <box>"
+  case "$name" in "$NAME_PREFIX"*) ;; *) name="$NAME_PREFIX$name" ;; esac
+  local log="$STATE_HOME/logs/$name.log"
+  [ -f "$log" ] || die "no log for '$name' (interactive boxes write to your terminal; try 'claude-box ps')"
+  if [ "$follow" = 1 ]; then tail -f "$log"; else cat "$log"; fi
+}
+
+cmd_stop() {
+  case "${1:-}" in
+    --daemon) engine_stop_daemon; return 0 ;;
+    --all)
+      local name stopped=0
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        note "stopping $name"; engine_stop_box "$name"; stopped=$((stopped + 1))
+      done <<< "$(engine_running_boxes)"
+      [ "$stopped" = 0 ] && echo "no boxes running"
+      return 0 ;;
+    "") die "usage: claude-box stop <box>|--all|--daemon" ;;
+    *)
+      local name="$1"
+      case "$name" in "$NAME_PREFIX"*) ;; *) name="$NAME_PREFIX$name" ;; esac
+      box_is_running "$name" || die "no running box named '$name'"
+      engine_stop_box "$name"; return 0 ;;
+  esac
+}
+
+# --- fan-out ------------------------------------------------------------------
+# N headless boxes, each on its own git worktree and its own branch, so they can
+# attack the same prompt (or the same task from different angles) without fighting
+# over the working tree. The worktrees are created FROM INSIDE a box because git
+# stores absolute paths in worktree admin files, and the host's path for the mount
+# is not the container's.
+cmd_run() {
+  local n=1 dir="" model="" yes_dir=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--boxes) n="${2:-}"; shift 2 ;;
+      -n*)        n="${1#-n}"; shift ;;
+      --model)    model="${2:-}"; shift 2 ;;
+      --)         shift; break ;;
+      -*)         break ;;
+      *)
+        if [ "$yes_dir" = 0 ] && [ -d "$1" ]; then dir="$1"; yes_dir=1; shift; else break; fi ;;
+    esac
+  done
+  local prompt="$*"
+  [ -n "$prompt" ] || die "usage: claude-box run -n <N> [<dir>] <prompt>"
+  case "$n" in ''|*[!0-9]*) die "-n needs a number" ;; esac
+  [ "$n" -ge 1 ] || die "-n must be at least 1"
+
+  resolve_target "$dir"
+  ensure_daemon
+  git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "'run' gives each box its own git worktree, but $TARGET is not a git repo"
+  size_for_fanout "$n"
+
+  local runid meta base_sha base_ref repo_ct wt_root_host wt_root_ct
+  runid="r$(date +%Y%m%d-%H%M%S)"
+  meta="$STATE_HOME/runs/$runid"; mkdir -p "$meta" "$STATE_HOME/logs"
+  base_sha="$(git -C "$TARGET" rev-parse HEAD)"
+  base_ref="$(git -C "$TARGET" rev-parse --abbrev-ref HEAD)"
+  repo_ct="$(to_container_path "$TARGET")"
+  wt_root_host="$MOUNT_SRC/.claude-box-runs/$runid"
+  wt_root_ct="$(to_container_path "$wt_root_host")"
+
+  # When the mount root IS the repo, the worktrees land inside it — keep them out
+  # of `git status` so an agent doesn't try to commit its siblings' work.
+  if [ "$MOUNT_SRC" = "$TARGET" ]; then
+    local excl="$(git -C "$TARGET" rev-parse --git-dir)/info/exclude"
+    grep -qxF '/.claude-box-runs/' "$excl" 2>/dev/null || {
+      mkdir -p "$(dirname "$excl")"; printf '/.claude-box-runs/\n' >> "$excl"; }
+  fi
+
+  note "creating $n worktree(s) from $base_ref ($(printf %.7s "$base_sha"))…"
+  local script i
+  script="set -e; mkdir -p '$wt_root_ct';"
+  for i in $(seq 1 "$n"); do
+    script="$script git -C '$repo_ct' worktree add -b 'claude-box/$runid-$i' '$wt_root_ct/$i' '$base_sha' >&2;"
+  done
+  WORKDIR="$repo_ct"
+  box_exec "$script" || die "worktree creation failed"
+
+  # %q, not plain interpolation: these values are sourced back in, and the macOS
+  # "Application Support" paths in them contain spaces.
+  {
+    printf 'runid=%q\n' "$runid";       printf 'engine=%q\n' "$ENGINE"
+    printf 'boxes=%q\n' "$n";           printf 'target=%q\n' "$TARGET"
+    printf 'repo_container=%q\n' "$repo_ct"
+    printf 'base_ref=%q\n' "$base_ref"; printf 'base_sha=%q\n' "$base_sha"
+    printf 'wt_root_host=%q\n' "$wt_root_host"
+    printf 'wt_root_container=%q\n' "$wt_root_ct"
+    printf 'mem=%q\n' "$CLAUDE_BOX_MEM"; printf 'cpus=%q\n' "$CLAUDE_BOX_CPUS"
+  } > "$meta/run.env"
+  printf '%s\n' "$prompt" > "$meta/prompt.txt"
+
+  # Refresh ONCE for the whole run, then tell the boxes to skip it. Otherwise N
+  # boxes start N simultaneous installs into the same bind-mounted pnpm global dir,
+  # contending for one store — the race is both slow and pointless.
+  if [ "${CLAUDE_BOX_SKIP_UPDATE:-}" != "1" ]; then
+    note "refreshing Claude Code once for the whole run…"
+    WORKDIR="$repo_ct"
+    box_exec claude-box-update > "$meta/update.log" 2>&1 || \
+      note "refresh failed (see $meta/update.log) — boxes will use the installed version"
+    export CLAUDE_BOX_SKIP_UPDATE=1
+  fi
+
+  # Claude Code refuses --permission-mode bypassPermissions when it is running as
+  # root — which the box always is — unless IS_SANDBOX=1 says the containment is
+  # already there. Set it only for these headless boxes: an interactive box has a
+  # human who can answer a prompt, so it keeps the ordinary auto-mode behaviour.
+  EXTRA_RUN_ARGS=(-e IS_SANDBOX=1)
+
+  note "launching $n box(es) at $CLAUDE_BOX_MEM / $CLAUDE_BOX_CPUS CPUs each"
+  printf '%-32s %-28s %s\n' BOX BRANCH LOG
+  for i in $(seq 1 "$n"); do
+    local name="$NAME_PREFIX$runid-$i" log claude_args
+    log="$STATE_HOME/logs/$name.log"
+    WORKDIR="$wt_root_ct/$i"
+    # bypassPermissions, not auto: nothing can answer a prompt in a headless box,
+    # and the box is the sandbox that makes that safe.
+    claude_args=(claude --permission-mode bypassPermissions)
+    [ -n "$model" ] && claude_args+=(--model "$model")
+    # shellcheck disable=SC2086
+    [ -n "${CLAUDE_BOX_RUN_ARGS:-}" ] && claude_args+=($CLAUDE_BOX_RUN_ARGS)
+    claude_args+=(-p "$prompt")
+    run_box_bg "$name" isolated "$log" "$meta/$i.exit" "${claude_args[@]}"
+    {
+      printf 'name=%q\n' "$name"; printf 'index=%q\n' "$i"
+      printf 'branch=%q\n' "claude-box/$runid-$i"
+      printf 'worktree_container=%q\n' "$wt_root_ct/$i"
+      printf 'worktree_host=%q\n' "$wt_root_host/$i"
+      printf 'log=%q\n' "$log"
+    } > "$meta/$i.env"
+    printf '%-32s %-28s %s\n' "$name" "claude-box/$runid-$i" "$log"
+  done
+  echo
+  echo "run id: $runid"
+  echo "  follow:  ./claude-box logs -f ${NAME_PREFIX}$runid-1"
+  echo "  status:  ./claude-box results $runid"
+  echo "  tidy up: ./claude-box cleanup $runid"
+}
+
+cmd_results() {
+  local runid="${1:-}"
+  [ -n "$runid" ] || die "usage: claude-box results <run-id>"
+  local meta="$STATE_HOME/runs/$runid"
+  [ -d "$meta" ] || die "unknown run id '$runid'"
+  # shellcheck disable=SC1090
+  . "$meta/run.env"
+  resolve_target "$target"
+  ensure_daemon
+  echo "run $runid — $boxes box(es) from $base_ref ($(printf %.7s "$base_sha"))"
+  echo "prompt: $(head -c 200 "$meta/prompt.txt")"
+  echo
+  local i name status exit_code script=""
+  printf '%-32s %-10s %s\n' BOX STATUS BRANCH
+  for i in $(seq 1 "$boxes"); do
+    # shellcheck disable=SC1090
+    ( . "$meta/$i.env"
+      if [ -f "$meta/$i.exit" ]; then
+        exit_code="$(cat "$meta/$i.exit")"
+        status="exit $exit_code"
+      elif box_is_running "$name"; then status="running"
+      else status="gone"; fi
+      printf '%-32s %-10s %s\n' "$name" "$status" "$branch" )
+  done
+  echo
+  for i in $(seq 1 "$boxes"); do
+    # shellcheck disable=SC1090
+    . "$meta/$i.env"
+    script="$script echo; echo '=== box $i ($branch) ==='; git -C '$worktree_container' --no-pager log --oneline '$base_sha'..HEAD | sed 's/^/  commit /'; git -C '$worktree_container' --no-pager diff --stat '$base_sha' | tail -5; u=\$(git -C '$worktree_container' status --porcelain | wc -l | tr -d ' '); echo \"  uncommitted paths: \$u\";"
+  done
+  WORKDIR="$repo_container"
+  box_exec "$script" || true
+}
+
+cmd_cleanup() {
+  local runid="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) force=1; shift ;;
+      *) runid="$1"; shift ;;
+    esac
+  done
+  [ -n "$runid" ] || die "usage: claude-box cleanup [-y] <run-id>"
+  local meta="$STATE_HOME/runs/$runid"
+  [ -d "$meta" ] || die "unknown run id '$runid'"
+  # shellcheck disable=SC1090
+  . "$meta/run.env"
+  resolve_target "$target"
+  ensure_daemon
+
+  local i still=0
+  for i in $(seq 1 "$boxes"); do
+    ( . "$meta/$i.env"; box_is_running "$name" ) && still=$((still + 1))
+  done
+  [ "$still" -gt 0 ] && die "$still box(es) of $runid are still running — './claude-box stop --all' first"
+
+  echo "About to permanently delete, for run $runid:"
+  echo "  - $boxes git worktree(s) under $wt_root_host, INCLUDING any uncommitted changes in them"
+  echo "  - the branches claude-box/$runid-1 … -$boxes (commits on them are lost unless merged elsewhere)"
+  echo "  - the per-box config dirs and logs under $STATE_HOME"
+  if [ "$force" != 1 ]; then
+    if [ -t 0 ]; then
+      printf 'Proceed? [y/N] '; local ans; read -r ans
+      case "$ans" in y|Y|yes|YES) ;; *) echo "aborted"; return 1 ;; esac
+    else
+      die "refusing to delete without confirmation — re-run with -y"
+    fi
+  fi
+
+  local script=""
+  for i in $(seq 1 "$boxes"); do
+    # shellcheck disable=SC1090
+    . "$meta/$i.env"
+    script="$script git -C '$repo_container' worktree remove --force '$worktree_container' || true; git -C '$repo_container' branch -D '$branch' || true;"
+  done
+  WORKDIR="$repo_container"
+  box_exec "$script git -C '$repo_container' worktree prune" || true
+  for i in $(seq 1 "$boxes"); do
+    # shellcheck disable=SC1090
+    ( . "$meta/$i.env"; rm -rf "$STATE_HOME/boxes/$name"; rm -f "$log" )
+  done
+  rmdir "$wt_root_host" 2>/dev/null || true
+  rm -rf "$meta"
+  note "run $runid cleaned up"
+}
+
+# --- main ---------------------------------------------------------------------
+mkdir -p "$CONFIG_HOME" "$STATE_HOME/logs" "$STATE_HOME/boxes" "$STATE_HOME/runs"
+detect_engine
+
+# The role-agent harness lives in its own file: it is a separate concern from
+# running one box, and keeping it out of here keeps both readable.
+# shellcheck source=harness/harness.sh
+[ -f "$SETUP_DIR/harness/harness.sh" ] && . "$SETUP_DIR/harness/harness.sh"
+
+# The tests source this file to exercise helpers (intent validation, memory
+# assembly, locking) directly, without a container and without dispatching.
+[ "${CLAUDE_BOX_SOURCE_ONLY:-}" = "1" ] && return 0
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  harness) shift; cmd_harness "$@"; exit $? ;;
+  role)    shift; cmd_role "$@"; exit $? ;;
+  build)   ensure_daemon; engine_build; exit $? ;;
+  ps)      cmd_ps; exit 0 ;;
+  logs)    shift; cmd_logs "$@"; exit 0 ;;
+  stop)    shift; cmd_stop "$@"; exit 0 ;;
+  run)     shift; cmd_run "$@"; exit 0 ;;
+  results) shift; cmd_results "$@"; exit 0 ;;
+  cleanup) shift; cmd_cleanup "$@"; exit 0 ;;
+esac
+
+# Target dir = current dir, unless the first arg is an existing directory.
+DIR=""
+if [ -n "${1:-}" ] && [ -d "$1" ]; then DIR="$1"; shift; fi
+resolve_target "$DIR"
+ensure_daemon
+
+BASE_NAME="$(slug "$(basename "$TARGET")")"
+[ -z "$BASE_NAME" ] && BASE_NAME=box
+[ -n "${CLAUDE_BOX_NAME:-}" ] && BASE_NAME="$(slug "$CLAUDE_BOX_NAME")"
+BOX_NAME="$(unique_name "$NAME_PREFIX$BASE_NAME")"
+
+# Set CLAUDE_BOX_ISOLATE=1 to give even a plain interactive box its own config
+# dir (separate history and --resume list, no chance of colliding with another).
+CFG_MODE=shared
+[ "${CLAUDE_BOX_ISOLATE:-}" = "1" ] && CFG_MODE=isolated
+
+if [ "${1:-}" = "shell" ]; then
+  shift
+  run_box_fg "$BOX_NAME" "$CFG_MODE" bash "$@"
+fi
+
+run_box_fg "$BOX_NAME" "$CFG_MODE" "$@"

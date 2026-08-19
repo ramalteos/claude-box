@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# claude-box pre-commit hook — refuse commits that contain secrets or agent scratch.
+#
+# Installed image-wide via `git config --global core.hooksPath`, so it applies in
+# every repo the box touches without any per-repo setup. gitleaks was already in
+# the image; this is what makes it actually block something. It matters most for
+# the headless boxes, which run in bypassPermissions mode with a forwarded GitHub
+# token and no human watching the diff.
+#
+# Escape hatches, in order of bluntness:
+#   CLAUDE_BOX_SKIP_GITLEAKS=1 git commit …   skip the scan for one commit
+#   git commit --no-verify                    skip all hooks
+# A repo that sets its own core.hooksPath (husky etc.) overrides this hook
+# entirely — repo config beats global config.
+set -uo pipefail
+
+# --- 1. paths that must never enter a product repo ----------------------------
+# Agent scratch — plans, specs, task copies, worktree and store directories — is
+# process exhaust, not deliverable. It is easy for a box to sweep it in with a broad
+# `git add`, and nobody notices until it is in the history. The task's own change is
+# what gets committed; everything below is refused.
+staged="$(git diff --cached --name-only 2>/dev/null || true)"
+if [ -n "$staged" ] && [ "${CLAUDE_BOX_ALLOW_SCRATCH:-}" != "1" ]; then
+  offenders="$(printf '%s\n' "$staged" | grep -E \
+    -e '(^|/)docs/superpowers/' \
+    -e '(^|/)\.harness/' \
+    -e '(^|/)\.claude-box-runs/' \
+    -e '(^|/)_wt/' \
+    -e '(^|/)\.pnpm-store/' \
+    -e '(^|/)CLAUDE\.local\.md$' \
+    -e '(^|/)\.claude/settings\.local\.json$' \
+    -e '\.original\.md$' \
+    || true)"
+  if [ -n "$offenders" ]; then
+    cat >&2 <<MSG
+
+claude-box: refusing to commit agent scratch — these paths are process exhaust, not
+part of the task's change:
+
+$(printf '%s\n' "$offenders" | sed 's/^/  /')
+
+Unstage them (git restore --staged <path>) and commit only the files the task needed.
+If one of these genuinely belongs in this repo:  CLAUDE_BOX_ALLOW_SCRATCH=1 git commit …
+MSG
+    exit 1
+  fi
+fi
+
+# --- 2. secrets ---------------------------------------------------------------
+[ "${CLAUDE_BOX_SKIP_GITLEAKS:-}" = "1" ] && exit 0
+command -v gitleaks >/dev/null 2>&1 || exit 0
+
+# `protect` is the long-standing spelling; newer gitleaks prefers `git`.
+if gitleaks protect --help >/dev/null 2>&1; then
+  set -- protect --staged
+else
+  set -- git --staged
+fi
+
+if ! gitleaks "$@" --redact --no-banner; then
+  cat >&2 <<'MSG'
+
+claude-box: gitleaks found a secret in the staged changes — commit blocked.
+Remove the secret (and rotate it if it was ever real), then commit again.
+If this is a false positive, add a rule to the repo's .gitleaksignore, or
+bypass once with:  CLAUDE_BOX_SKIP_GITLEAKS=1 git commit …
+MSG
+  exit 1
+fi

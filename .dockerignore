@@ -1,0 +1,7 @@
+# Only the files the Dockerfile actually COPYs need to reach the build context;
+# everything else just slows the transfer to the builder VM down.
+.git
+.gitignore
+README.md
+CLAUDE.md
+claude-box

@@ -1,0 +1,36 @@
+{
+  "$schema": "Control-panel config for the claude-box harness. Edit, then commit.",
+  "org": "",
+  "reposRoot": "~/Documents/GitHub",
+  "authorEmail": "",
+  "defaultRepo": null,
+  "maxAgentsInFlight": 3,
+  "roles": [
+    "project-manager",
+    "lead-dev",
+    "qa-reviewer",
+    "devops",
+    "cataloguer"
+  ],
+  "models": {
+    "light": "haiku",
+    "standard": "sonnet",
+    "deep": "opus",
+    "apex": "fable"
+  },
+  "fallbackModel": null,
+  "roleTiers": {
+    "project-manager": "deep",
+    "lead-dev": "standard",
+    "qa-reviewer": "deep",
+    "devops": "standard",
+    "cataloguer": "standard"
+  },
+  "roleEffort": {
+    "project-manager": "xhigh",
+    "lead-dev": "high",
+    "qa-reviewer": "xhigh",
+    "devops": "high",
+    "cataloguer": "medium"
+  }
+}
