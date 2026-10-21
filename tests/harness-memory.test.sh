@@ -61,8 +61,21 @@ evidence: demo-repo/src/x.ts:12
 This service reads its config at boot only; restart after changing it.
 EOF
 assert_ok "repo proposal accepted" memory_accept "$INST/.harness/pending/repo-one.md"
-assert_ok "repo proposal landed in the product repo" \
-  test -f "$CLAUDE_BOX_ROOT/demo-repo/.harness/memory/learnings/repo-one.md"
+# Panel-owned, keyed by repo. Writing into the product repo left a dozen untracked files in
+# a monorepo working tree nobody asked us to modify, and nothing ever committed them.
+assert_ok "repo proposal landed in the panel, scoped to the repo" \
+  test -f "$INST/memory/repos/demo-repo/repo-one.md"
+assert_fails "and nothing was written into the product repo" \
+  test -e "$CLAUDE_BOX_ROOT/demo-repo/.harness/memory/learnings/repo-one.md"
+
+# A repo that ships its own learnings is still read — the harness just never writes there.
+# (The fixture above already put one at .harness/memory/learnings/kafka.md.)
+mkdir -p "$CLAUDE_BOX_ROOT/demo-repo/.harness/memory"
+printf -- '---\ntier: repo\n---\n\nShipped with the code.\n' \
+  > "$CLAUDE_BOX_ROOT/demo-repo/.harness/memory/shipped.md"
+mem="$(memory_preamble demo-repo)"
+assert_contains "panel memory is in the prompt" "$mem" "restart after changing it"
+assert_contains "and so is memory the repo ships" "$mem" "Shipped with the code."
 
 cat > "$INST/.harness/pending/bad-tier.md" <<'EOF'
 ---

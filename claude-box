@@ -8,8 +8,11 @@
 #   ./claude-box [<dir>] <args>             Pass args to claude (--resume, --model …)
 #   ./claude-box [<dir>] shell              Drop into a bash shell inside the sandbox
 #   ./claude-box run -n N [<dir>] <prompt>  Fan out N headless boxes over N worktrees
+#   ./claude-box headless [<dir>] --name <box> --prompt-file <f> [--worktree <id> [--branch <b>]]
+#                                           One headless box, foreground (orchestrator seam)
+#   ./abox <anything>                       Same runner, engine pinned to Apple `container`
 #   ./claude-box ps                         List running boxes
-#   ./claude-box logs [-f] <box>            Show one box's log
+#   ./claude-box logs [-f] [--raw] <box>    Show one box's log (rendered from its stream)
 #   ./claude-box results <run-id>           Exit code, branch and diffstat per box
 #   ./claude-box cleanup <run-id>           Remove that run's worktrees and branches
 #   ./claude-box stop <box>|--all           Stop one box, or every box
@@ -188,6 +191,16 @@ engine_running_boxes() {
       # `container ls` has no name filter; take the first whitespace field.
       container ls 2>/dev/null | awk '{print $1}' | grep "^${NAME_PREFIX}" || true
       ;;
+  esac
+}
+
+# When the engine thinks a container started, as RFC 3339. The authoritative answer for any
+# box — including one whose driver died, or one started before the runner recorded start times.
+engine_box_started() {
+  case "$ENGINE" in
+    docker)    docker inspect -f '{{.State.StartedAt}}' "$1" 2>/dev/null || true ;;
+    container) container inspect "$1" 2>/dev/null | sed -n 's/.*"startedAt"[: ]*"\([^"]*\)".*/\1/p' | head -1 ;;
+    fake)      : ;;
   esac
 }
 
@@ -377,6 +390,29 @@ resolve_config_mount() {
   #   .claude.json      — copied, because Claude Code rewrites it constantly and parallel
   #                       boxes sharing it is the collision this isolation exists to avoid
   if [ -f "$CONFIG_HOME/.credentials.json" ]; then
+    # Box names repeat between runs, so a per-box config dir outlives its box — and Claude
+    # Code, when it refreshes a token, replaces the symlink with a REGULAR file. The
+    # entrypoint deliberately never overwrites what a box already has, so that regular file
+    # froze one box on the token it happened to hold. Refresh tokens rotate: by the next run
+    # some other box had rotated it, this one's copy could no longer refresh, and the box died
+    # with "OAuth session expired and could not be refreshed" in 80ms. Carry a newer token
+    # back, then drop the copy so the entrypoint links it to the shared login again.
+    local mine="$ISOLATED_CFG/.credentials.json"
+    if [ -f "$mine" ] && [ ! -L "$mine" ]; then
+      if [ "$mine" -nt "$CONFIG_HOME/.credentials.json" ]; then
+        # Only a copy that made it back may be dropped: if the cp fails this is the newest
+        # refresh token anywhere, and the next run gets another chance to carry it.
+        if cp "$mine" "$CONFIG_HOME/.credentials.json" 2>/dev/null; then
+          note "carried a newer token back from $name"
+          rm -f "$mine"
+        else
+          note "could not carry the newer token back from $name — keeping its copy"
+        fi
+      else
+        rm -f "$mine"
+      fi
+      [ -f "$mine" ] || note "relinked $name to the shared login (it was holding its own stale copy)"
+    fi
     CONFIG_ARGS+=(-v "$CONFIG_HOME:/root/.claude-host")
   else
     note "no login found in $CONFIG_HOME — run 'claude-box' once and /login before using isolated or headless boxes"
@@ -509,6 +545,10 @@ run_box_bg() {
   build_run_args "$name" "$cfg_mode"
   mkdir -p "$(dirname "$log")" "$(dirname "$exit_file")"
   rm -f "$exit_file"
+  # When this box started, recorded explicitly. Box names are REUSED, and the log file is
+  # truncated rather than recreated, so a file's birth time belongs to whichever box held the
+  # name first — which is how the dashboard came to show a six-minute box as running 1h53m.
+  date +%s > "$log.started"
   nohup bash -c '
     "$1" run --rm "${@:5}" >"$2" 2>&1
     echo $? >"$3"
@@ -539,8 +579,17 @@ usage() {
 
 # --- subcommands --------------------------------------------------------------
 cmd_ps() {
-  local names name log
+  local names name log started=0
+  [ "${1:-}" = "--started" ] && started=1
   names="$(engine_running_boxes)"
+  if [ "$started" = 1 ]; then
+    # name<TAB>RFC3339 — machine-readable, for the dashboard's elapsed counters.
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      printf '%s\t%s\n' "$name" "$(engine_box_started "$name")"
+    done <<< "$names"
+    return 0
+  fi
   [ -z "$names" ] && { echo "no boxes running"; return 0; }
   printf '%-40s %s\n' BOX LOG
   while IFS= read -r name; do
@@ -552,13 +601,35 @@ cmd_ps() {
 }
 
 cmd_logs() {
-  local follow=0
-  [ "${1:-}" = "-f" ] && { follow=1; shift; }
+  local follow=0 raw=0
+  while :; do
+    case "${1:-}" in
+      -f)    follow=1; shift ;;
+      --raw) raw=1; shift ;;
+      *)     break ;;
+    esac
+  done
   local name="${1:-}"
   [ -n "$name" ] || die "usage: claude-box logs [-f] <box>"
   case "$name" in "$NAME_PREFIX"*) ;; *) name="$NAME_PREFIX$name" ;; esac
   local log="$STATE_HOME/logs/$name.log"
   [ -f "$log" ] || die "no log for '$name' (interactive boxes write to your terminal; try 'claude-box ps')"
+  # Headless boxes write stream-json; render it unless asked for the raw stream.
+  local renderer="$SETUP_DIR/harness/render-log.py"
+  if [ "$raw" = 0 ] && [ -x "$renderer" ] && head -c 1 "$log" 2>/dev/null | grep -q '{'; then
+    if [ "$follow" = 1 ]; then
+      # Per-invocation scratch file: two followers sharing one would garble each other.
+      local line_file="$STATE_HOME/.render-line.$$"
+      tail -n 200 -f "$log" | while IFS= read -r line; do
+        printf '%s\n' "$line" > "$line_file"
+        python3 "$renderer" "$line_file" 2>/dev/null
+      done
+      rm -f "$line_file"
+    else
+      python3 "$renderer" "$log"
+    fi
+    return 0
+  fi
   if [ "$follow" = 1 ]; then tail -f "$log"; else cat "$log"; fi
 }
 
@@ -588,6 +659,15 @@ cmd_stop() {
 # over the working tree. The worktrees are created FROM INSIDE a box because git
 # stores absolute paths in worktree admin files, and the host's path for the mount
 # is not the container's.
+# When the mount root IS the repo, worktrees land inside it — keep them out of
+# `git status` so an agent doesn't try to commit its siblings' work.
+exclude_run_dirs() {
+  [ "$MOUNT_SRC" = "$TARGET" ] || return 0
+  local excl; excl="$(git -C "$TARGET" rev-parse --git-dir)/info/exclude"
+  grep -qxF '/.claude-box-runs/' "$excl" 2>/dev/null || {
+    mkdir -p "$(dirname "$excl")"; printf '/.claude-box-runs/\n' >> "$excl"; }
+}
+
 cmd_run() {
   local n=1 dir="" model="" yes_dir=0
   while [ $# -gt 0 ]; do
@@ -621,13 +701,7 @@ cmd_run() {
   wt_root_host="$MOUNT_SRC/.claude-box-runs/$runid"
   wt_root_ct="$(to_container_path "$wt_root_host")"
 
-  # When the mount root IS the repo, the worktrees land inside it — keep them out
-  # of `git status` so an agent doesn't try to commit its siblings' work.
-  if [ "$MOUNT_SRC" = "$TARGET" ]; then
-    local excl="$(git -C "$TARGET" rev-parse --git-dir)/info/exclude"
-    grep -qxF '/.claude-box-runs/' "$excl" 2>/dev/null || {
-      mkdir -p "$(dirname "$excl")"; printf '/.claude-box-runs/\n' >> "$excl"; }
-  fi
+  exclude_run_dirs
 
   note "creating $n worktree(s) from $base_ref ($(printf %.7s "$base_sha"))…"
   local script i
@@ -696,6 +770,108 @@ cmd_run() {
   echo "  follow:  ./claude-box logs -f ${NAME_PREFIX}$runid-1"
   echo "  status:  ./claude-box results $runid"
   echo "  tidy up: ./claude-box cleanup $runid"
+}
+
+# One headless box for an external orchestrator (claude-graph): one prompt, one
+# optional worktree, in the foreground, the box's exit code passed through. The
+# orchestrator owns control flow; this owns everything the engine needs to know,
+# so the orchestrator never sees a container path or an engine flag.
+cmd_headless() {
+  local dir="" name="" wt="" branch="" prompt_file="" sys_file="" model="" effort="" remove=0 yes_dir=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)               name="${2:-}"; shift 2 ;;
+      --worktree)           wt="${2:-}"; shift 2 ;;
+      --branch)             branch="${2:-}"; shift 2 ;;
+      --prompt-file)        prompt_file="${2:-}"; shift 2 ;;
+      --system-prompt-file) sys_file="${2:-}"; shift 2 ;;
+      --model)              model="${2:-}"; shift 2 ;;
+      --effort)             effort="${2:-}"; shift 2 ;;
+      --remove)             remove=1; shift ;;
+      -*)                   die "unknown flag for 'headless': $1" ;;
+      *) if [ "$yes_dir" = 0 ] && [ -d "$1" ]; then dir="$1"; yes_dir=1; shift
+         else die "unexpected argument: $1"; fi ;;
+    esac
+  done
+  local usage="usage: claude-box headless [<dir>] --name <box> --prompt-file <file> [--worktree <id> [--branch <name>]] [--system-prompt-file <file>] [--model <m>] [--effort <e>]  |  [<dir>] --worktree <id> --remove"
+  case "$wt"   in *[!A-Za-z0-9._-]*) die "worktree id must match [A-Za-z0-9._-]: '$wt'" ;; esac
+  case "$name" in *[!A-Za-z0-9._-]*) die "box name must match [A-Za-z0-9._-]: '$name'" ;; esac
+  case "$branch" in *..*|-*|/*|*[!A-Za-z0-9._/-]*) die "branch must match [A-Za-z0-9._/-], no leading - or /, no ..: '$branch'" ;; esac
+  [ -n "$branch" ] && [ -z "$wt" ] && die "--branch needs --worktree"
+
+  resolve_target "$dir"
+  local repo_ct wt_host="" wt_ct="" meta=""
+  repo_ct="$(to_container_path "$TARGET")"
+  if [ -n "$wt" ]; then
+    git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1 \
+      || die "--worktree needs a git repo, and $TARGET is not one"
+    wt_host="$MOUNT_SRC/.claude-box-runs/$wt"
+    wt_ct="$(to_container_path "$wt_host")"
+    meta="$STATE_HOME/runs/wt-$wt.env"
+  fi
+
+  if [ "$remove" = 1 ]; then
+    [ -n "$wt" ] || die "--remove needs --worktree <id>"
+    [ -z "$name$prompt_file$sys_file" ] || die "--remove takes no --name, prompt or system prompt"
+    ensure_daemon
+    WORKDIR="$repo_ct"
+    box_exec "git -C '$repo_ct' worktree remove --force '$wt_ct' 2>/dev/null; git -C '$repo_ct' worktree prune" \
+      || die "worktree removal failed"
+    # The in-container remove deletes the tree. A dir still here was never a worktree
+    # (a run that died before `worktree add`), so only an EMPTY one is cleared.
+    if [ -d "$wt_host" ]; then
+      rmdir "$wt_host" 2>/dev/null || die "worktree dir still present after removal: $wt_host"
+    fi
+    branch="$(sed -n 's/^branch=//p' "$meta" 2>/dev/null)"
+    rm -f "$meta"
+    note "worktree $wt removed (branch ${branch:-claude-box/$wt} kept)"
+    return 0
+  fi
+
+  [ -n "$name" ] || die "$usage (--name is required)"
+  [ -n "$prompt_file" ] || die "$usage (--prompt-file is required)"
+  [ -f "$prompt_file" ] || die "no such prompt file: $prompt_file"
+  [ -z "$sys_file" ] || [ -f "$sys_file" ] || die "no such system prompt file: $sys_file"
+  ensure_daemon
+  type require_login >/dev/null 2>&1 && require_login
+
+  local base
+  if [ -n "$wt" ]; then
+    if [ -d "$wt_host" ]; then
+      # Every later role on the same task reports the base the FIRST one cut from, so
+      # the orchestrator's diff stays anchored even when HEAD has moved since.
+      # The branch is whatever the FIRST call chose; a later --branch cannot move it.
+      branch="$(sed -n 's/^branch=//p' "$meta" 2>/dev/null)"
+      [ -n "$branch" ] || branch="claude-box/$wt"
+      base="$(sed -n 's/^base=//p' "$meta" 2>/dev/null)"
+      [ -n "$base" ] || base="$(git -C "$TARGET" merge-base HEAD "$branch" 2>/dev/null \
+                                || git -C "$TARGET" rev-parse HEAD)"
+    else
+      [ -n "$branch" ] || branch="claude-box/$wt"
+      exclude_run_dirs
+      base="$(git -C "$TARGET" rev-parse HEAD)"
+      WORKDIR="$repo_ct"
+      box_exec "set -e; mkdir -p '$(dirname "$wt_ct")'; git -C '$repo_ct' worktree add -b '$branch' '$wt_ct' '$base' >&2" \
+        || die "worktree creation failed"
+      mkdir -p "$(dirname "$meta")"
+      printf 'base=%s\nbranch=%s\n' "$base" "$branch" > "$meta"
+    fi
+    printf 'worktree=%s\nbranch=%s\nbase=%s\n' "$wt_host" "$branch" "$base"
+    WORKDIR="$wt_ct"
+  fi
+
+  name="$NAME_PREFIX$name"
+  box_is_running "$name" && die "a box named $name is already running — stop it or pick another name"
+  printf 'box=%s\n' "$name"
+  local claude_args=(claude --permission-mode bypassPermissions --output-format stream-json --verbose)
+  [ -n "$model" ]    && claude_args+=(--model "$model")
+  [ -n "$effort" ]   && claude_args+=(--effort "$effort")
+  [ -n "$sys_file" ] && claude_args+=(--append-system-prompt "$(cat "$sys_file")")
+  claude_args+=(-p "$(cat "$prompt_file")")
+  # bypassPermissions as root — every box is root — needs IS_SANDBOX to say the
+  # containment is already there. Same as `run` and `role`.
+  EXTRA_RUN_ARGS=(-e IS_SANDBOX=1)
+  run_box_fg "$name" isolated "${claude_args[@]}"
 }
 
 cmd_results() {
@@ -793,19 +969,27 @@ detect_engine
 # shellcheck source=harness/harness.sh
 [ -f "$SETUP_DIR/harness/harness.sh" ] && . "$SETUP_DIR/harness/harness.sh"
 
-# The tests source this file to exercise helpers (intent validation, memory
-# assembly, locking) directly, without a container and without dispatching.
-[ "${CLAUDE_BOX_SOURCE_ONLY:-}" = "1" ] && return 0
+# The tests source this file to exercise helpers (intent validation, memory assembly,
+# locking) directly, without a container and without dispatching.
+#
+# The sourced check matters as much as the env var: a stray exported CLAUDE_BOX_SOURCE_ONLY
+# would otherwise turn every `claude-box` invocation into a silent no-op — which is exactly
+# what happened when a test's `VAR=1 . claude-box` leaked (assignments to the `.` builtin
+# persist in the calling shell).
+if [ "${CLAUDE_BOX_SOURCE_ONLY:-}" = "1" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 case "${1:-}" in
   -h|--help|help) usage ;;
   harness) shift; cmd_harness "$@"; exit $? ;;
   role)    shift; cmd_role "$@"; exit $? ;;
   build)   ensure_daemon; engine_build; exit $? ;;
-  ps)      cmd_ps; exit 0 ;;
+  ps)      shift; cmd_ps "$@"; exit 0 ;;
   logs)    shift; cmd_logs "$@"; exit 0 ;;
   stop)    shift; cmd_stop "$@"; exit 0 ;;
   run)     shift; cmd_run "$@"; exit 0 ;;
+  headless) shift; cmd_headless "$@"; exit $? ;;
   results) shift; cmd_results "$@"; exit 0 ;;
   cleanup) shift; cmd_cleanup "$@"; exit 0 ;;
 esac

@@ -11,8 +11,8 @@ Beyond the single interactive box, the runner is an orchestrator: named boxes
 headless boxes over N git worktrees (`results`, `cleanup`).
 
 On top of that sits the **harness** (`harness/`): role agents — `project-manager`,
-`lead-dev`, `qa-reviewer`, `devops`, `cataloguer` — each running in its own box, under
-a real cross-session lock, with reviewed memory and a localhost dashboard. The roles,
+`architect`, `lead-dev`, `qa-reviewer`, `devops`, `cataloguer` — each running in its own
+box, under a real cross-session lock, with reviewed memory and a localhost dashboard. The roles,
 schema and panel template ship IN THIS REPO (`harness/roles/`, `harness/template/`);
 `claude-box harness init <dir>` stamps a panel. The document protocol is deliberately
 compatible with an ai-bridge instance, which can be used as a panel unmodified. See

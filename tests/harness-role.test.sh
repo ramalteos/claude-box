@@ -68,6 +68,14 @@ assert_contains "permission mode is bypass"                        "$argv" "bypa
 assert_contains "the root is mounted with \$HOME-relative parity"  "$argv" "$CLAUDE_BOX_ROOT:/root/root"
 assert_contains "the mount path is exported for the entrypoint"    "$argv" "CLAUDE_BOX_MOUNT=/root/root"
 
+# Auth sharing. The obvious shape — bind-mounting the shared credentials file ONTO a path
+# inside the per-box config mount — is rejected by Docker Desktop ("mountpoint is outside
+# of rootfs") and killed every box with exit 125 as soon as a login existed. The shared dir
+# gets its own path and the entrypoint links the one file that must be shared.
+assert_contains "the shared config dir is mounted at its own path" "$argv" ":/root/.claude-host"
+assert_fails "nothing is mounted INSIDE the per-box config mount" \
+  bash -c 'case "$1" in *"/root/.claude/.credentials.json"*) exit 0 ;; *) exit 1 ;; esac' _ "$argv"
+
 # --- a whole tick with the fake engine ---------------------------------------
 : > "$CLAUDE_BOX_FAKE_STATE/argv.log"
 mkdir -p "$INST/.harness/intents"
@@ -148,5 +156,25 @@ assert_ok "the no-target box launches" \
   wait_for_text "$CLAUDE_BOX_FAKE_STATE/argv.log" "## Repositories"
 assert_contains "with no target, ambiguity is an open question, not a guess" \
   "$(cat "$CLAUDE_BOX_FAKE_STATE/argv.log")" "ask it rather than guessing"
+
+
+# Every role is told its wall clock and when to wrap up, or a box spends the whole budget
+# exploring and is killed with the work uncommitted.
+sys="$(bash -c 'CLAUDE_BOX_SOURCE_ONLY=1 . "$1"; set +e; resolve_instance "$2" >/dev/null 2>&1
+  CLAUDE_BOX_ROLE_TIMEOUT=1200 role_system_prompt lead-dev demo-repo' _ "$CB" "$INST")"
+assert_contains "the prompt states the budget in minutes" "$sys" "20 minutes"
+assert_contains "and the wrap-up point" "$sys" "15 minutes"
+assert_contains "and what to do with partial work" "$sys" "draft pull request"
+
+
+# Rounds happen in the task document. A PR that collects one comment per review round buries
+# the one comment a human needs, so the standards forbid it and allow exactly one on approval.
+# Substrings must survive the file's line wrapping, so keep them short.
+qa_sys="$(bash -c 'CLAUDE_BOX_SOURCE_ONLY=1 . "$1"; set +e; resolve_instance "$2" >/dev/null 2>&1
+  role_system_prompt qa-reviewer demo-repo' _ "$CB" "$INST")"
+assert_contains "the prompt forbids per-round PR comments" "$qa_sys" "comment on the pull request"
+assert_contains "and forbids gh pr review between agents" "$qa_sys" "gh pr review"
+assert_contains "and allows one comment when it is finished" "$qa_sys" "only when it is finished"
+assert_contains "and says the body is rewritten, not appended" "$qa_sys" "never appended"
 
 summary

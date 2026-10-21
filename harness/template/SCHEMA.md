@@ -33,11 +33,32 @@ description: <one line>
 kind: build | research          # build ships code; research produces documents
 status: active | paused | done
 target_repo: <org>/<repo>       # build only; the default for this project's tasks
+jira_epic:                      # the epic tracking this project, e.g. DPT-1200
+objective: /objectives/<slug>.md  # why this project exists and how we will know it worked
 timestamp: <ISO 8601>
 ---
 ```
 
 Body: `# Context` (why this exists, what "done" looks like).
+
+## type: Objective — `/objectives/<slug>.md`
+
+```yaml
+---
+type: Objective
+status: active | met | abandoned
+projects: [ "/projects/<slug>/index.md" ]
+timestamp: <ISO 8601>
+---
+```
+
+Body, ten lines at most: the goal in one line, **Why now** (what it costs us today), **Done
+when** (two to four checkable statements — a number, a behaviour, a gate that passes), and
+**Not doing** (the neighbouring work someone would otherwise assume is included).
+
+The project-manager writes it when it drafts a project and keeps it current; `status: met` is a
+claim about the world, so it cites what proves each "done when" statement. A project without an
+objective is work whose value nobody stated.
 
 ## type: Task — `/projects/<slug>/tasks/<id>.md`
 
@@ -58,13 +79,29 @@ depends_on: [ /projects/<slug>/tasks/<id>.md, ... ]   # bundle-relative
 acceptance_criteria: [ "<testable outcome>", ... ]
 open_questions: [ "Q1: <question that blocks this>", ... ]
 pr: [ ]                         # PR URL(s), set by the implementing role
-qa:                             # approved | changes-requested — set ONLY by qa-reviewer
+qa:                             # approved | changes-requested
+                                # set ONLY by qa-reviewer
+design_review:                  # required — the project-manager asks for an architecture review
+arch:                           # sound | changes-requested — set ONLY by architect
+box:                            # the box working this task right now — written by the HOST
+started_at:                     # when that box started — written by the HOST
+blocked_reason:                 # one line, when the host can see why
+jira:                           # the issue tracking this task, e.g. DPT-1234
 timestamp: <ISO 8601>
 ---
 ```
 
 Body headings, in this order: `# Context`, `# Notes` (refinement by the
-project-manager), `# Result` (written by the role that did the work).
+project-manager), `# Result` (written by the role that did the work), `# Review`
+(the qa-reviewer's findings for the round), `# Design review` (the architect's).
+
+**Roles hand work to each other here, not in the pull request.** A review round is a
+conversation between two boxes: the implementer reads this document before every round, so
+findings belong in `# Review`, and the pull request keeps one body — rewritten in place, never
+appended — plus a single comment once the change is finished. A PR that collects a comment per
+round buries the one comment a human needs under three that are already resolved. `gh pr review`
+is not an agent's to spend: `--request-changes` and `--approve` are review events that notify
+people and change the merge state.
 
 **`target_repo` accepts `<org>/<repo>` or a bare `<repo>`.** Either way it must
 resolve to a clone directly under the repos root; the harness normalises it and
@@ -94,16 +131,65 @@ draft ──│ YOU promote │──► ready ──► in-progress ⇄ in-revi
 | --- | --- | --- |
 | `draft` | Initial state. Refined when `acceptance_criteria` are filled and `open_questions` is empty. Awaiting your approval. | you, project-manager |
 | `ready` | Approved for execution. | **you only** |
-| `in-progress` | A role box is working it. | project-manager on dispatch, then the role |
-| `in-review` | PR open, awaiting review or merge. | the implementing role |
+| `in-progress` | A role box is working it. | **the host**, when it launches the box |
+| `in-review` | PR open, awaiting review or merge. | the implementing role, or **the host** once a PR URL exists |
 | `blocked` | Blocked on something external; says what in `# Notes`. | anyone |
 | `cancelled` | Abandoned or superseded. Terminal. | you, project-manager |
-| `done` | Every PR on the task is merged. | project-manager reflecting reality, or you |
+| `done` | Every PR on the task is merged. | project-manager reflecting reality, or you — `harness done <task>`, or the dashboard's **mark done** button. Yours from any state: the command never refuses on status, and records in `# Notes` what every PR on the task actually was at that moment, merged or not |
 
 **Mapping to OKF's own task statuses**, for anything that reads the bundle generically:
 `draft`/`ready` → `todo`, `in-progress`/`in-review`/`blocked` → `in_progress`,
 `done`/`cancelled` → `done`. The extra states exist to hold the two human gates, which
 OKF has no concept of.
+
+### Who writes a status
+
+The host writes the transitions it can **verify**: `in-progress` when it launches a box,
+`in-review` once a PR URL exists, back to `ready` if a box ended cleanly without opening one,
+`blocked` if a box died without one. Depending on an agent to remember a bookkeeping step
+made the board unreliable — a task being worked on still read `ready`, a finished one still
+read `in-progress`.
+
+Roles write the statuses that need judgement — `blocked` with a reason — and the verdict
+fields `qa:` and `arch:`. Nobody but the human (or the host under autonomy) writes `ready`.
+
+### A finished draft is handed over automatically
+
+A role opens a PR as a **draft** when it could not settle every criterion. Once `qa: approved`
+is written, the architect has not objected, and no CI check is failing, the change is finished as
+far as any agent can take it — so **the host marks the PR ready for review** and moves the task
+to `in-review`. Roles never do this themselves: a role marking its own work ready for review is
+the review equivalent of merging your own PR.
+
+It stays a draft while a check fails and while `qa` says anything other than `approved`.
+
+### The qa verdict has two values, and CI is the source of truth
+
+| `qa:` | What it means | Who acts next |
+| --- | --- | --- |
+| `approved` | every criterion met, with a CI run as the evidence | the host merges it under autonomy `full`, otherwise you |
+| `changes-requested` | a defect against the criteria, **or** a criterion no CI job proves yet | the implementing role, another round |
+
+No third value. A criterion that cannot be checked inside a box is a job that does not exist
+yet, and writing that job is work — so it is `changes-requested`, with the job named. The host
+enforces this: any verdict that is not `approved` sends the task back with instructions to wire
+the verification into CI. A suite no job runs is a suite nobody runs.
+
+The third one matters because it is not a failure and not an agent's turn. A task in that state
+with **green CI is normal**: the checks that ran passed, and the missing evidence is the part CI
+did not run. Re-dispatching a role will not change it.
+
+### The design gate
+
+A task whose frontmatter says `design_review: required` is not implemented until the
+`architect` has judged the approach and written `arch: sound`. On `arch: changes-requested`
+the task goes back to `draft` for the project-manager to rework — nothing is built.
+
+The project-manager asks for a review when the work sets a precedent: a new service or
+package, a schema or public API change, anything crossing a repo boundary, a migration, a
+new external dependency, or a pattern the codebase does not already have. It does not ask
+for one on a bug fix, a test, or a change that follows an existing pattern — a gate that
+fires on everything is a tax, not a check.
 
 ### Autonomy
 
@@ -166,13 +252,38 @@ per document. Scan it and open only what you need — never bulk-read `knowledge
 
 **No customer PII in any document here.**
 
+## Jira
+
+When `jira.enabled` is true in `instance.config.json`, work is **mirrored** into Jira. The
+panel stays the source of truth for what the work is; Jira is where the organisation tracks
+it. One direction only — the panel drives Jira. Two-way sync is how tracker integrations rot.
+
+| Panel | Jira |
+| --- | --- |
+| project | **Epic** — key recorded in `jira_epic:` on `project.md` |
+| task | **Story** (or Task/Bug, by nature) — key recorded in `jira:` on the task |
+| separable steps inside one task | **Sub-tasks** under that story, only when they are genuinely separable |
+
+Status mirroring, by whoever is doing the work:
+
+| Panel status | Jira |
+| --- | --- |
+| `in-progress` | transition to In Progress |
+| `in-review` | transition to In Review (or the nearest equivalent), comment with the PR link |
+| `blocked` | comment with the reason; flag the issue if the workflow supports it |
+| `done` | transition to Done |
+| `cancelled` | close as won't do, with the reason |
+
+Access comes from the account's Atlassian connector, which is available inside every box —
+no token is forwarded and none is stored in the panel.
+
 ## Memory tiers
 
 | Tier | Location | Grows by |
 | --- | --- | --- |
 | Global | `<state>/harness/memory/` | you accepting a proposal |
 | This panel's knowledge base | `knowledge/` | the `cataloguer`, directly |
-| Repo-local | `<repo>/.harness/memory/` | you accepting a proposal |
+| Repo-scoped | `<panel>/memory/repos/<repo>/` | you accepting a proposal |
 
 Role boxes propose into `.harness/pending/`; `claude-box harness memory` is where a
 proposal becomes memory. The knowledge base is the exception — the cataloguer writes

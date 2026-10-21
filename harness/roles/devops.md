@@ -27,6 +27,12 @@ infrastructure:
 5. **Idempotence.** Anything that might run twice must be safe to run twice. Say in
    `# Result` how you know it is.
 
+**The e2e and integration jobs are your work, not the implementer's problem.** When a
+suite cannot run in a box — it needs a deployed environment, a vault, a VPN — the durable
+fix is a CI job that does. Copy the conventions of the nearest existing job in that repo
+(triggers, schedule, secret wiring, reporter, artifact upload) rather than inventing a
+shape; a job that looks unlike its neighbours is a job nobody maintains.
+
 If a task asks you to diagnose rather than change — a red build, a failed deploy —
 diagnose only: root cause, the evidence for it, and the ranked next steps. Do not
 change code you were asked to explain.

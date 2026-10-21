@@ -62,4 +62,23 @@ else
   fail "CLAUDE_BOX_ALLOW_DIRECT_PUSH=1 overrides it" "still refused"
 fi
 
+# --- secrets are caught at push, not only at commit --------------------------
+# A repo that sets its own core.hooksPath replaces our pre-commit hook, and several such
+# hooks cannot run in a box at all (`brew install gitleaks`). Push is therefore the gate
+# that always runs.
+if command -v gitleaks >/dev/null 2>&1; then
+  git -C "$WORK" checkout -q -b feat/t9-secret-probe
+  printf 'const token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";\n' > "$WORK/leak.ts"
+  git -C "$WORK" add leak.ts
+  git -C "$WORK" -c core.hooksPath=/dev/null commit -qm "feat: add token"   # commit hook bypassed
+  out="$(push origin HEAD 2>&1 || true)"
+  assert_contains "a secret is refused at push even if the commit hook was bypassed" "$out" "gitleaks found a secret"
+  assert_fails "the branch did not reach the remote" \
+    bash -c 'git -C "$1" rev-parse --verify refs/heads/feat/t9-secret-probe' _ "$ORIGIN"
+  assert_ok "the documented bypass works for a false positive" \
+    bash -c 'CLAUDE_BOX_SKIP_GITLEAKS=1 git -C "$1" push -q origin HEAD' _ "$WORK"
+else
+  ok "a secret is refused at push (skipped — gitleaks not on this host)"
+fi
+
 summary

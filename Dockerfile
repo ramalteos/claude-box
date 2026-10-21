@@ -81,7 +81,9 @@ ENV PATH=$VP_HOME/bin:$PATH
 RUN curl -fsSL https://vite.plus | bash
 
 # Vite+ manages Node by default and auto-installs the latest LTS on first use of
-# its shims (node/corepack), so no explicit `vp env install` step is needed.
+# its shims, so no explicit `vp env install` step is needed. Vite+ 1.3 dropped the
+# `corepack` shim (it ships a `pnpm` shim instead), so corepack is used only where
+# it still exists; the pnpm shim is the baseline path.
 
 # --- pnpm via corepack, then Claude Code -------------------------------------
 # TWO pnpm global dirs, and the order on PATH is the point:
@@ -96,13 +98,19 @@ RUN curl -fsSL https://vite.plus | bash
 #     SECOND on PATH, so it is the offline fallback when the mounted dir is empty
 #     (first ever run) or the update failed.
 ARG PNPM_VERSION=latest
+# Corepack downloads the pnpm version a repo pins in packageManager. Point its cache at the
+# persisted pnpm dir so that download happens once per host, not once per box.
+ENV COREPACK_HOME=/root/pnpm-global/corepack
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 ENV PNPM_BASELINE_HOME=/root/.local/share/pnpm
 ENV PNPM_HOME=/root/pnpm-global
 ENV PATH=/root/pnpm-global/bin:/root/.local/share/pnpm/bin:$PATH
 # pnpm v11 blocks dependency build scripts by default; --allow-build lets
 # claude-code run its postinstall (which downloads the platform-native binary).
-RUN corepack enable \
- && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
+RUN if command -v corepack >/dev/null 2>&1; then \
+      corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate; \
+    fi \
+ && pnpm --version \
  && PNPM_HOME="$PNPM_BASELINE_HOME" pnpm add -g \
       --allow-build=@anthropic-ai/claude-code @anthropic-ai/claude-code \
  && mkdir -p /root/pnpm-global/bin

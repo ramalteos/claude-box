@@ -9,6 +9,7 @@
   --bg: #f7f8fa; --panel: #ffffff; --panel-2: #f2f4f7; --line: #e3e6ea;
   --ink: #16191d; --ink-2: #5b6472; --ink-3: #8a93a1;
   --accent: #2f6feb; --ok: #1f8a4c; --warn: #b7791f; --bad: #c0392b; --idle: #8a93a1;
+  --violet: #6b46c1; --teal: #0f766e; --rose: #a3376b;
   --radius: 12px; --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -16,6 +17,7 @@
     --bg: #0f1216; --panel: #161a20; --panel-2: #1c222a; --line: #262d37;
     --ink: #e7ebf0; --ink-2: #a3adbb; --ink-3: #6f7a89;
     --accent: #5c93ff; --ok: #3fbd6f; --warn: #e0a83c; --bad: #ef6a5c;
+    --violet: #a78bfa; --teal: #4dd4c1; --rose: #f472a8;
   }
 }
 * { box-sizing: border-box; }
@@ -32,11 +34,56 @@ header {
 }
 h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
 h1 span { color: var(--ink-3); font-weight: 450; }
-main { padding: 20px; max-width: 1500px; margin: 0 auto; }
-section { margin-bottom: 28px; }
+main { padding: 20px; max-width: 1600px; margin: 0 auto; }
+section { margin-bottom: 24px; }
+/* Two columns for the middle of the page: the things you read together, side by side.
+   Collapses to one column on a narrow window. */
+.cols { display: grid; gap: 20px; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); align-items: start; }
+@media (max-width: 1180px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+.cols > div { min-width: 0; }
+/* Secondary sections fold away — but a collapsed section must still LOOK like a panel.
+   As bare uppercase labels floating in whitespace they read as stray text, not as something
+   you can open. So each one is a card with a clickable header. */
+details.sec {
+  margin-bottom: 12px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+}
+details.sec > summary {
+  cursor: pointer; list-style: none; user-select: none;
+  display: flex; align-items: center; gap: 8px; padding: 11px 14px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--ink-2); font-weight: 650;
+}
+details.sec > summary::-webkit-details-marker { display: none; }
+details.sec > summary::before {
+  content: "›"; font-size: 14px; line-height: 1; color: var(--ink-3);
+  transition: transform .15s ease; transform-origin: 50% 50%;
+}
+details.sec[open] > summary::before { transform: rotate(90deg); }
+details.sec > summary::after {
+  content: "open"; margin-left: auto; font-size: 10px; letter-spacing: .04em;
+  color: var(--ink-3); text-transform: none; opacity: 0; transition: opacity .15s ease;
+}
+details.sec[open] > summary::after { content: "close"; }
+details.sec > summary:hover { background: var(--panel-2); color: var(--ink); }
+details.sec > summary:hover::after { opacity: 1; }
+details.sec[open] > summary { border-bottom: 1px solid var(--line); }
+/* Content sits flush inside the card, so the card is the boundary — not a box in a box. */
+details.sec > .scroll, details.sec > .grid.bounded {
+  border: 0; border-radius: 0; background: transparent; max-height: min(46vh, 540px);
+}
+details.sec > .grid.bounded { padding: 12px; }
+details.sec > .note { padding: 0 14px 12px; margin: 0; }
+details.sec .empty { border: 0; }
 h2 {
-  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
-  color: var(--ink-3); margin: 0 0 10px; font-weight: 650;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--ink-2); margin: 0 0 10px; font-weight: 650;
+  display: flex; align-items: center; gap: 8px;
+}
+/* A leading rule, so an open section's title reads as a heading rather than a caption. */
+h2::before {
+  content: ""; width: 3px; height: 12px; border-radius: 2px;
+  background: var(--accent); opacity: .55; flex: none;
 }
 .pill {
   display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
@@ -62,7 +109,10 @@ h2 {
 .badge.pm    { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
 .badge.dev   { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
 .badge.qa    { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
-.badge.other { background: var(--panel-2); }
+.badge.arch  { background: color-mix(in srgb, var(--violet) 18%, transparent); color: var(--violet); }
+.badge.ops   { background: color-mix(in srgb, var(--teal) 20%, transparent); color: var(--teal); }
+.badge.lib   { background: color-mix(in srgb, var(--rose) 16%, transparent); color: var(--rose); }
+.badge.other { background: var(--panel-2); color: var(--ink-2); }
 .mono { font-family: var(--mono); font-size: 12px; }
 .muted { color: var(--ink-2); }
 .dim { color: var(--ink-3); }
@@ -73,7 +123,12 @@ button {
 }
 button:hover { border-color: var(--accent); color: var(--accent); }
 .board { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
-.col { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; }
+.col {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 10px;
+  /* Columns scroll independently, so one long column cannot stretch the whole row. */
+  max-height: min(58vh, 700px); overflow: auto; overscroll-behavior: contain;
+}
 .col h3 {
   font-size: 11px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .07em;
   color: var(--ink-3); display: flex; justify-content: space-between;
@@ -81,13 +136,43 @@ button:hover { border-color: var(--accent); color: var(--accent); }
 .task { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 9px 10px; margin-bottom: 8px; }
 .task:last-child { margin-bottom: 0; }
 .task .t { font-weight: 550; font-size: 13px; }
+/* The task id is how you refer to a card out loud ("t4 is blocked"), so it is on the card. */
+.tid {
+  font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--ink-3);
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px;
+  padding: 0 4px; margin-right: 6px; vertical-align: 1px;
+}
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .chip { font-size: 11px; padding: 2px 7px; border-radius: 5px; background: var(--panel-2); color: var(--ink-2); }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); font-weight: 600; padding: 6px 10px; }
 td { padding: 8px 10px; border-top: 1px solid var(--line); vertical-align: top; }
 tr:hover td { background: var(--panel-2); }
-.scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+/* Every list is bounded and scrolls INSIDE itself. Without this the page grows without
+   limit — ten items per section and the whole thing becomes a scroll-hunt. */
+.scroll.tight { max-height: min(30vh, 300px); }
+.scroll {
+  overflow: auto; max-height: min(52vh, 620px);
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  overscroll-behavior: contain;
+}
+/* A bounded table needs its header to stay put, or you scroll away from the column names. */
+.scroll thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+/* Card grids are bounded the same way. */
+.grid.bounded { max-height: min(46vh, 560px); overflow: auto; overscroll-behavior: contain; padding-right: 4px; }
+.col h3 { position: sticky; top: 0; background: var(--panel-2); padding-bottom: 6px; z-index: 1; }
+/* A scrollbar that only appears on hover keeps the panels calm. */
+.scroll::-webkit-scrollbar, .grid.bounded::-webkit-scrollbar, .col::-webkit-scrollbar,
+#logbody::-webkit-scrollbar { width: 10px; height: 10px; }
+.scroll::-webkit-scrollbar-thumb, .grid.bounded::-webkit-scrollbar-thumb,
+.col::-webkit-scrollbar-thumb, #logbody::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 6px; border: 2px solid transparent; background-clip: content-box;
+}
+.scroll:hover::-webkit-scrollbar-thumb, .grid.bounded:hover::-webkit-scrollbar-thumb,
+.col:hover::-webkit-scrollbar-thumb { background: var(--ink-3); background-clip: content-box; }
 .empty { color: var(--ink-3); font-size: 13px; padding: 14px; text-align: center; background: var(--panel); border: 1px dashed var(--line); border-radius: var(--radius); }
 .note { font-size: 12px; color: var(--ink-3); margin-top: 8px; }
 .note code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
@@ -97,8 +182,34 @@ tr:hover td { background: var(--panel-2); }
   transition: transform .22s cubic-bezier(.2,.8,.2,1); display: flex; flex-direction: column; z-index: 20;
 }
 #drawer.open { transform: translateY(0); box-shadow: 0 -18px 40px rgba(0,0,0,.18); }
+/* 62vh is right for a log tail and cramped for a task document that runs to 200 lines, so the
+   height is the reader's choice and it is remembered. */
+#drawer.tall { height: 94vh; }
+#drawer .md { max-width: 88ch; }
 #drawer header { position: static; background: none; backdrop-filter: none; }
 #logbody { flex: 1; overflow: auto; margin: 0; padding: 14px 20px; font-family: var(--mono); font-size: 12px; line-height: 1.55; white-space: pre-wrap; color: var(--ink-2); }
+/* Rendered task plans. The drawer doubles as a log view, so the markdown container opts
+   out of the monospace/pre-wrap the log needs. */
+#logbody.md { font-family: inherit; font-size: 14px; white-space: normal; color: var(--ink); padding: 18px 24px 40px; }
+.md h1, .md h2, .md h3 { margin: 22px 0 8px; line-height: 1.3; letter-spacing: -0.01em; }
+.md h1 { font-size: 19px; } .md h2 { font-size: 16px; } .md h3 { font-size: 14px; color: var(--ink-2); }
+.md h2 { padding-top: 14px; border-top: 1px solid var(--line); }
+.md p { margin: 8px 0; max-width: 78ch; }
+.md ul, .md ol { margin: 8px 0 8px 22px; padding: 0; max-width: 78ch; }
+.md li { margin: 4px 0; }
+.md code { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); padding: 1.5px 5px; border-radius: 4px; }
+.md pre { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; }
+.md pre code { background: none; padding: 0; font-size: 12px; line-height: 1.5; }
+.md blockquote { margin: 10px 0; padding: 2px 0 2px 14px; border-left: 3px solid var(--line); color: var(--ink-2); }
+.md hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
+.md a { color: var(--accent); }
+.md table { margin: 10px 0; font-size: 13px; }
+.md .crit { display: flex; gap: 10px; align-items: flex-start; margin: 6px 0; max-width: 78ch; }
+.md .crit .n { flex: none; width: 1.6em; text-align: right; color: var(--ink-3); font-family: var(--mono); font-size: 12px; padding-top: 1px; }
+.md .qa { background: color-mix(in srgb, var(--warn) 8%, transparent); border-left: 3px solid var(--warn); padding: 10px 14px; border-radius: 0 8px 8px 0; margin: 8px 0; max-width: 78ch; }
+.md .qa.answered { background: color-mix(in srgb, var(--ok) 8%, transparent); border-left-color: var(--ok); }
+.md .qa .ans { display: block; margin-top: 6px; color: var(--ok); font-weight: 550; }
+.md .meta { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
 </style>
 </head>
 <body>
@@ -108,69 +219,197 @@ tr:hover td { background: var(--panel-2); }
   <span class="pill" id="autonomy">–</span>
   <span class="pill" id="capacity">–</span>
   <span class="pill" id="lasttick">–</span>
+  <span class="pill" id="spend">–</span>
   <span class="spacer"></span>
+  <button id="notify" onclick="Notification.requestPermission()">notify me</button>
+  <span id="actionbar"></span>
   <span class="pill"><span class="dot live"></span><span id="refreshed">live</span></span>
 </header>
 
 <main>
-  <section>
-    <h2>In flight</h2>
-    <div class="grid" id="boxes"></div>
-  </section>
+  <!-- What is happening right now, first: on a panel that is working, this is the answer to
+       "what is going on" and it changes every few seconds. Everything else is standing state. -->
+  <details class="sec" id="sec-boxes" open>
+    <summary>In flight <span class="dim" id="boxescount"></span></summary>
+    <div class="grid bounded" id="boxes"></div>
+  </details>
 
-  <section>
-    <h2>Board</h2>
+  <!-- What needs a decision. Collapsible, and bounded: with the roles fixing their own
+       blocks this list empties on its own, and a tall list of rows nobody has to act on
+       pushed the board off the screen. -->
+  <details class="sec" id="sec-attention" open hidden>
+    <summary>Needs you <span class="dim" id="attentioncount"></span></summary>
+    <div class="scroll tight" id="attention"></div>
+    <p class="note">Questions: <code>claude-box harness answer</code>. Blocked tasks: read the task's <code># Result</code>.</p>
+  </details>
+
+  <!-- The work itself. -->
+  <details class="sec" id="sec-board" open>
+    <summary>Board <span class="dim">— click a task for the full plan</span></summary>
     <div class="board" id="board"></div>
-  </section>
+  </details>
 
-  <section>
-    <h2>Pending memory <span class="dim" id="pendingcount"></span></h2>
-    <div class="grid" id="pending"></div>
-    <p class="note">Acceptance is a terminal step, deliberately: run <code>claude-box harness memory</code>. Nothing here is memory yet.</p>
-  </section>
+  <div class="cols">
+    <div>
+      <details class="sec" id="sec-prs" open>
+        <summary>Pull requests <span class="dim" id="prscount"></span></summary>
+        <div class="scroll" id="prs"></div>
+      </details>
 
-  <section>
-    <h2>Rejected intents</h2>
-    <div class="scroll" id="rejected"></div>
-  </section>
+      <details class="sec" id="sec-activity" open>
+        <summary>Activity <span class="dim" id="timelinecount"></span></summary>
+        <div class="scroll" id="timeline"></div>
+      </details>
 
-  <section>
-    <h2>Ticks</h2>
-    <div class="scroll" id="ticks"></div>
-  </section>
+      <details class="sec" id="sec-runs">
+        <summary>Runs <span class="dim" id="runscount"></span></summary>
+        <div class="scroll" id="ticks"></div>
+      </details>
+    </div>
+
+    <div>
+      <details class="sec" id="sec-objectives" open>
+        <summary>Objectives <span class="dim" id="objectivescount"></span></summary>
+        <div class="scroll" id="objectives"></div>
+      </details>
+
+      <details class="sec" id="sec-projects" open>
+        <summary>Projects <span class="dim" id="projectscount"></span></summary>
+        <div class="scroll" id="projects"></div>
+      </details>
+
+      <details class="sec" id="sec-pending" open>
+        <summary>Pending memory <span class="dim" id="pendingcount"></span></summary>
+        <div class="grid bounded" id="pending"></div>
+        <p class="note" id="pendingnote"></p>
+      </details>
+
+      <details class="sec" id="sec-knowledge">
+        <summary>Knowledge <span class="dim" id="knowledgecount"></span></summary>
+        <div class="scroll" id="knowledge"></div>
+      </details>
+
+      <details class="sec" id="sec-memory">
+        <summary>Memory <span class="dim" id="memcount"></span></summary>
+        <div class="scroll" id="memory"></div>
+      </details>
+
+      <details class="sec" id="sec-roles">
+        <summary>Roles <span class="dim">— who can be dispatched, at what cost</span></summary>
+        <div class="scroll" id="rolestats"></div>
+      </details>
+
+      <details class="sec" id="sec-logs">
+        <summary>Logs <span class="dim" id="logscount"></span></summary>
+        <div class="scroll" id="logs"></div>
+      </details>
+
+      <details class="sec" id="sec-refused">
+        <summary>Refused dispatches <span class="dim" id="rejectedcount"></span></summary>
+        <div class="scroll" id="rejected"></div>
+      </details>
+    </div>
+  </div>
 </main>
 
 <div id="drawer">
   <header>
     <strong class="mono" id="logname">log</strong>
     <span class="spacer"></span>
+    <button id="drawersize" onclick="toggleDrawerHeight()">expand</button>
     <button onclick="closeLog()">close</button>
   </header>
   <pre id="logbody"></pre>
 </div>
 
 <script>
+const API_EXPECTED = 18;      // must match server.py's API_VERSION
+const ACTION_TOKEN = "__ACTION_TOKEN__";
+const ACTIONS_ON = ACTION_TOKEN.length > 0;
+let notified = new Set();
+// Every role that ships, plus ai-bridge's names, plus a derived fallback — a role added
+// later must not render as an unstyled grey chip while its neighbours are coloured.
 const ROLE_CLASS = {
-  "project-manager": "pm", "lead-dev": "dev", "devops": "dev",
-  "software-engineer": "dev", "devops-engineer": "dev",
-  "qa-reviewer": "qa", "cataloguer": "other", "auditor": "other", "oncall-guide": "other",
+  "project-manager": "pm",
+  "architect": "arch",
+  "lead-dev": "dev", "software-engineer": "dev",
+  "qa-reviewer": "qa",
+  "devops": "ops", "devops-engineer": "ops", "oncall-guide": "ops",
+  "cataloguer": "lib", "auditor": "lib",
+};
+const BADGE_CLASSES = ["pm", "arch", "dev", "qa", "ops", "lib"];
+const roleClass = (role) => {
+  if (ROLE_CLASS[role]) return ROLE_CLASS[role];
+  if (!role) return "other";
+  let h = 0;
+  for (const ch of role) h = (h * 31 + ch.charCodeAt(0)) % 997;
+  return BADGE_CLASSES[h % BADGE_CLASSES.length];
 };
 const COLUMNS = ["draft", "ready", "in-progress", "in-review", "blocked", "done"];
 let openBox = null, state = null;
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// For a value going INSIDE an inline handler: esc() alone is not enough there, because the
+// entities decode before the JS parses, so an agent-written id holding a quote would close
+// the string and run on a page that carries the action token. JSON first, then the attribute.
+const jsq = (s) => esc(JSON.stringify(String(s ?? "")));
+// localStorage throws with site data blocked (private window, cleared storage); a preference
+// is never worth a blank page.
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* preference only */ } },
+};
+// A Jira key is only useful if it is one click from the page. Top level: the task drawer
+// renders outside render() and needs it too.
+const jiraUrl = (key) => (state && state.jira && state.jira.site && key)
+  ? `${state.jira.site}/browse/${encodeURIComponent(key)}` : "";
 
 function dur(sec) {
-  if (sec == null) return "–";
+  if (sec == null || Number.isNaN(sec)) return "–";
   if (sec < 60) return sec + "s";
   const m = Math.floor(sec / 60), h = Math.floor(m / 60);
   return h ? `${h}h ${m % 60}m` : `${m}m ${sec % 60}s`;
 }
 const ago = (ts) => ts ? dur(Math.max(0, Math.round(Date.now() / 1000 - ts))) + " ago" : "never";
 
+// Replacing innerHTML with identical markup still tears the DOM down and rebuilds it: on a
+// 3-second poll that reads as cards blinking out and back while you scroll. Compare first and
+// leave the DOM alone when nothing changed — which is most polls.
+function setHTML(id, html) {
+  const el = document.getElementById(id);
+  if (!el || el.__html === html) return;
+  el.__html = html;
+  el.innerHTML = html;
+}
+
 function render(s) {
   state = s;
+  // Only offer an action the RUNNING server knows: it may predate the page on disk.
+  const srvActions = (s.actions && s.actions.supported) || null;
+  const can = (name) => ACTIONS_ON && (srvActions ? srvActions.includes(name) : false);
+  const actionsStale = ACTIONS_ON && !srvActions;
+  // Normalise once, so a payload from an older server degrades instead of throwing. This
+  // page and the server are separate artifacts: updating the runner while a server keeps
+  // running is normal, and it used to leave the page blank below the first section.
+  s.tasks = (s.tasks || []).map(t => ({
+    prs: [], pr_status: [], criteria: [], questions: [], unanswered: [], depends_on: [],
+    project: "", title: t.id || "", status: "?", ...t,
+  }));
+  for (const k of ["boxes", "projects", "logs", "ticks", "runs", "timeline", "role_stats",
+                   "pending", "rejected", "attention"]) s[k] = s[k] || [];
+  s.spend = s.spend || {};
+  s.cap = s.cap || {};
+  s.lock = s.lock || {};
+
+  const stale = s.api !== undefined && s.api !== API_EXPECTED;
+
+  // Counts, because a bounded list hides how much there is.
+  const n = (id, count, cap) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = count ? (cap && count >= cap ? `(${count}, newest first)` : `(${count})`) : "";
+  };
+
   document.getElementById("slug").textContent = s.instance;
 
   const lock = document.getElementById("lock");
@@ -189,84 +428,392 @@ function render(s) {
 
   document.getElementById("capacity").textContent =
     `${s.cap.inflight}/${s.cap.declared} boxes in flight`;
+  const sp = s.spend || {};
+  document.getElementById("spend").textContent =
+    `$${(sp.today ?? 0).toFixed(2)} today · $${(sp.total ?? 0).toFixed(2)} total · ${sp.boxes ?? 0} boxes`;
+
   const latest = s.ticks[0];
   document.getElementById("lasttick").textContent =
     latest ? `tick ${latest.id.replace(/^t/, "")} · ${ago(latest.when)}` : "no ticks yet";
 
   // in flight
+  // A box name carries only the task id, which repeats across projects — match it to a
+  // real task so the worktree lookup is unambiguous.
+  for (const b of s.boxes) {
+    const hit = s.tasks.find(t => t.id === b.task) ||
+                s.tasks.find(t => t.path.endsWith(`/${b.task}.md`));
+    b.taskPath = hit ? hit.path : "";
+  }
   const boxes = document.getElementById("boxes");
   boxes.innerHTML = s.boxes.length ? s.boxes.map(b => `
     <div class="card live">
       <div class="card-head">
-        <span class="badge ${ROLE_CLASS[b.role] || "other"}">${esc(b.role)}</span>
+        <span class="badge ${roleClass(b.role)}">${esc(b.role)}</span>
         <span class="mono muted">${esc(b.task || "—")}</span>
-        <span class="elapsed" data-started="${b.started || ""}">${dur(b.elapsed)}</span>
+        <span class="elapsed" data-started="${b.started || ""}">${b.started ? dur(b.elapsed) : "elapsed unknown"}</span>
       </div>
       <div class="mono dim" style="word-break:break-all">${esc(b.name)}</div>
-      <div style="margin-top:10px"><button onclick="showLog('${esc(b.name)}')">log</button></div>
+      ${b.last ? `<div class="mono" style="margin-top:8px;color:var(--ink-2);font-size:12px">${esc(b.last)}</div>` : ""}
+      ${b.run && (b.run.tools || b.run.cost_usd) ? `<div class="chips" style="margin-top:8px">
+        ${b.run.tools ? `<span class="chip">${b.run.tools} tool calls</span>` : ""}
+        ${b.run.errors ? `<span class="chip" style="color:var(--bad)">${b.run.errors} tool errors</span>` : ""}
+        ${b.run.cost_usd ? `<span class="chip">$${b.run.cost_usd.toFixed(4)}</span>` : ""}
+        ${b.run.turns ? `<span class="chip">${b.run.turns} turns</span>` : ""}
+      </div>` : ""}
+      <div style="margin-top:10px">
+        <button onclick="showLog(${jsq(b.name)})">log</button>
+        ${b.taskPath ? `<button onclick="showProgress(${jsq(b.taskPath)})">files written</button>` : ""}
+        ${b.taskPath ? `<button onclick="showDiff(${jsq(b.taskPath)})">diff</button>` : ""}
+        ${can("stop") ? `<button onclick="act('stop',${jsq(b.name)})">stop</button>` : ""}
+      </div>
     </div>`).join("") : `<div class="empty">No boxes running. Start one with <code>claude-box harness tick</code>.</div>`;
+
+  n("boxescount", s.boxes.length);
+
+  // needs you — one list, because scattered across four sections is how things get missed
+  const att = s.attention;
+  const attSection = document.getElementById("sec-attention");
+  attSection.hidden = att.length === 0;
+  document.getElementById("attentioncount").textContent = att.length ? `(${att.length})` : "";
+  const KIND = { question: ["qa", "answer"], blocked: ["qa", "blocked"], pr: ["dev", "PR"],
+               box: ["other", "box"], stalled: ["qa", "stalled"] };
+  setHTML("attention", att.length ? `
+    <table><thead><tr><th>what</th><th>task</th><th>detail</th><th></th></tr></thead><tbody>
+    ${att.map(a => {
+      const [cls, label] = KIND[a.kind] || ["other", a.kind];
+      const mergeable = (a.detail || "").includes("mergeable");
+      // Clicking the row opens the thing it is about, and the row carries the command that
+      // resolves it — a notification you have to go and interpret is not much of a help.
+      const opener = a.open === "log" ? `showLog(${jsq(a.title)})`
+                   : a.task ? `showTask(${jsq(a.task)})` : "";
+      return `<tr${opener ? ` style="cursor:pointer" onclick="${opener}"` : ""}>
+        <td><span class="badge ${cls}">${esc(label)}</span></td>
+        <td><div class="t">${a.id ? `<span class="tid">${esc(a.id)}</span>` : ""}${esc(a.title || "")}</div>
+            <div class="dim mono">${esc(a.task || "")}</div></td>
+        <td${mergeable ? ' style="color:var(--ok);font-weight:550"' : ""}>
+          <div style="white-space:normal;max-width:70ch">${esc(a.detail || "")}</div>
+          ${a.action ? `<div class="dim mono" style="font-size:11px;margin-top:4px">${esc(a.action)}</div>` : ""}
+        </td>
+        <td>${a.url ? `<a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">open</a>` : ""}</td></tr>`;
+    }).join("")}
+    </tbody></table>` : "");
+
+  // desktop notification when something new needs you
+  if (window.Notification && Notification.permission === "granted") {
+    for (const a of att) {
+      const key = `${a.kind}:${a.task}:${a.detail}`;
+      if (!notified.has(key)) {
+        notified.add(key);
+        if (notified.size > 1) new Notification("claude-box: " + a.kind, { body: `${a.title}\n${a.detail}` });
+      }
+    }
+  }
+
+  // projects — what is being worked on
+  setHTML("projects", s.projects.length ? `
+    <table><thead><tr><th>project</th><th>repo</th><th>tasks</th><th>state</th><th>waiting</th></tr></thead><tbody>
+    ${s.projects.map(p => `<tr>
+      <td><div class="t">${esc(p.title)}</div><div class="dim mono">${esc(p.slug)}</div>
+          ${p.description ? `<div class="dim" style="font-size:12px;margin-top:4px">${esc(p.description)}</div>` : ""}</td>
+      <td class="mono dim">${esc(p.repo)}
+          ${p.jira_epic ? `<div>${jiraUrl(p.jira_epic)
+              ? `<a href="${esc(jiraUrl(p.jira_epic))}" target="_blank" rel="noopener noreferrer">${esc(p.jira_epic)}</a>`
+              : esc(p.jira_epic)}</div>` : ""}</td>
+      <td>${p.tasks}</td>
+      <td>${Object.entries(p.counts).map(([k, v]) =>
+            `<span class="chip">${esc(k)} ${v}</span>`).join(" ") || "<span class=dim>—</span>"}</td>
+      <td>${p.waiting ? `<span class="badge qa">${p.waiting}</span>` : `<span class="dim">–</span>`}
+          ${can("done") && p.status !== "done" && p.path
+            ? `<div style="margin-top:6px"><button onclick="act('done',${jsq(p.path)})" title="close the project out: records which of its tasks were not yet done or cancelled">mark done</button></div>` : ""}
+          ${can("delete-project")
+            ? `<div style="margin-top:6px"><button onclick="actDanger('delete-project',${jsq(p.slug)},${jsq(p.slug)},${jsq(`Delete the project ${p.slug} and all ${p.tasks} of its tasks?`)})" title="remove this project's documents, worktrees and local branches">delete</button></div>` : ""}</td>
+    </tr>`).join("")}
+    </tbody></table>` : `<div class="empty">No projects yet — <code>claude-box harness do "&lt;what you want&gt;"</code></div>`);
+
+  // every PR, whether or not it needs you right now
+  const prs = s.prs || [];
+  n("prscount", prs.length);
+  const ciColour = (ci) => ci === "passing" ? "var(--ok)" : ci === "failing" ? "var(--bad)"
+                        : ci === "running" ? "var(--warn)" : "var(--ink-3)";
+  setHTML("prs", prs.length ? `
+    <table><thead><tr><th>PR</th><th>task</th><th>state</th><th>CI</th><th>verdicts</th><th>size</th></tr></thead><tbody>
+    ${prs.map(p => `<tr style="cursor:pointer" onclick="showTask(${jsq(p.task)})">
+      <td><a href="${esc(p.url || "#")}" target="_blank" rel="noopener noreferrer"
+             onclick="event.stopPropagation()">#${esc(p.number ?? "?")}</a>
+          ${p.draft ? `<div class="dim">draft</div>` : ""}</td>
+      <td><div class="t">${esc(p.title)}</div>
+          <div class="dim mono">${esc(p.project)}/${esc(p.id)}${p.repo ? ` · ${esc(p.repo.split("/").pop())}` : ""}</div></td>
+      <td>${esc(p.state || "?")}
+          ${p.merge_state && p.merge_state !== "CLEAN" ? `<div class="dim">${esc(p.merge_state.toLowerCase())}</div>` : ""}
+          ${p.working ? `<div class="chip" style="color:var(--ok)">working</div>` : ""}</td>
+      <td style="color:${ciColour(p.ci)}">${esc(p.ci === "none-ran" ? "no job ran" : (p.ci || "—"))}
+          ${p.ci_detail ? `<div class="dim" style="color:var(--ink-3)">${esc(p.ci_detail)}</div>` : ""}
+          ${(p.caused_here || []).length ? `<div style="color:var(--bad)">this PR: ${esc(p.caused_here.join(", "))}</div>` : ""}
+          ${(p.pre_existing || []).length ? `<div class="dim">pre-existing: ${esc(p.pre_existing.join(", "))}</div>` : ""}</td>
+      <td>${p.mergeable ? `<div class="chip" style="color:var(--ok);font-weight:600">ready to merge</div>` : ""}
+          ${p.qa ? `<span class="chip">qa ${esc(p.qa)}</span>` : ""}
+          ${p.arch ? `<span class="chip">arch ${esc(p.arch)}</span>` : ""}</td>
+      <td class="mono dim">${p.files != null ? `${esc(p.files)} files` : ""}
+          ${p.additions != null ? `<div>+${esc(p.additions)}/-${esc(p.deletions ?? 0)}</div>` : ""}</td>
+    </tr>`).join("")}
+    </tbody></table>` : `<div class="empty">No pull requests yet.</div>`);
 
   // board
   const byStatus = {};
   for (const t of s.tasks) (byStatus[t.status] = byStatus[t.status] || []).push(t);
   const seen = new Set(COLUMNS);
   const cols = COLUMNS.concat(Object.keys(byStatus).filter(k => !seen.has(k)));
-  document.getElementById("board").innerHTML = cols.map(col => {
+  setHTML("board", cols.map(col => {
     const items = byStatus[col] || [];
-    return `<div class="col"><h3><span>${esc(col)}</span><span>${items.length}</span></h3>
-      ${items.map(t => `<div class="task">
-        <div class="t">${esc(t.title || t.id)}</div>
+    return `<div class="col" id="col-${esc(col.replace(/[^a-z0-9]+/gi, "-"))}"><h3><span>${esc(col)}</span><span>${items.length}</span></h3>
+      ${items.map(t => `<div class="task" onclick="showTask(${jsq(t.path)})" style="cursor:pointer">
+        <div class="t"><span class="tid">${esc(t.id || "")}</span>${esc(t.title || t.id)}</div>
+        ${t.description ? `<div class="dim" style="font-size:12px;margin-top:3px">${esc(t.description)}</div>` : ""}
+        ${t.status === "blocked" && (t.blocked_reason || t.why_short)
+            ? `<div style="font-size:12px;margin-top:5px;color:var(--warn)">blocked: ${esc(t.blocked_reason || t.why_short)}</div>`
+            : t.next_action ? `<div style="font-size:12px;margin-top:5px;color:${t.stalled ? "var(--warn)" : "var(--ink-2)"}">${esc(t.next_action)}</div>` : ""}
         <div class="chips">
-          ${t.repo ? `<span class="chip">${esc(t.repo)}</span>` : ""}
+          <span class="chip">${esc(t.project)}</span>
+          ${t.repo ? `<span class="chip">${esc(t.repo.split("/").pop())}</span>` : ""}
           ${t.assignee ? `<span class="chip">${esc(t.assignee)}</span>` : ""}
-          ${t.pr ? `<span class="chip">PR ${esc(t.pr)}</span>` : ""}
-        </div></div>`).join("") || `<div class="dim" style="font-size:12px">—</div>`}
+          ${t.working ? `<span class="chip" style="color:var(--ok)">working</span>` : ""}
+          ${t.stalled ? `<span class="chip" style="color:var(--warn)">stalled</span>` : ""}
+          ${t.criteria.length ? `<span class="chip">${t.criteria.length} criteria</span>` : ""}
+          ${t.unanswered.length ? `<span class="chip" style="color:var(--warn)">${t.unanswered.length} waiting</span>` : ""}
+          ${t.jira ? `<span class="chip">${esc(t.jira)}</span>` : ""}
+          ${t.qa ? `<span class="chip">qa ${esc(t.qa)}</span>` : ""}
+          ${(t.pr_status || []).map(p => `<span class="chip" title="${esc(p.ci_detail || "")}" style="color:${
+              p.ci === "passing" ? "var(--ok)" : p.ci === "failing" ? "var(--bad)" :
+              p.ci === "running" ? "var(--warn)" : "var(--ink-3)"}">PR #${esc(p.number ?? "?")}${
+              p.isDraft ? " draft" : ""}${p.ci ? " · CI " + esc(p.ci === "skipped" ? "ran nothing" : p.ci) : ""}</span>`).join("")}
+        </div>
+        ${can("promote") && t.status === "draft" ? `<div style="margin-top:6px"><button onclick="event.stopPropagation();act('promote',${jsq(t.path)})">promote</button></div>` : ""}
+        ${can("done") && t.status !== "done" ? `<div style="margin-top:6px"><button onclick="event.stopPropagation();act('done',${jsq(t.path)})" title="close this out yourself: records what every PR on it was at that moment, merged or not">mark done</button></div>` : ""}
+        ${can("delete-task") ? `<div style="margin-top:6px"><button onclick="event.stopPropagation();actDanger('delete-task',${jsq(t.path)},${jsq(t.id)},${jsq(`Delete the task ${t.id} — ${(t.title || "").slice(0, 60)}?`)})" title="remove this task's document, worktree and local branch">delete</button></div>` : ""}
+        </div>`).join("") || `<div class="dim" style="font-size:12px">—</div>`}
     </div>`;
-  }).join("");
+  }).join(""));
 
-  // pending memory
+  // activity — one order of events, instead of three tables to cross-reference
+  const tl = s.timeline || [];
+  setHTML("timeline", tl.length ? `
+    <table><tbody>
+    ${tl.map(e => `<tr>
+      <td class="dim" style="width:9em">${ago(e.when)}</td>
+      <td style="width:9em"><span class="chip">${esc(e.what)}</span></td>
+      <td class="mono" style="word-break:break-all">${esc(e.detail)}</td></tr>`).join("")}
+    </tbody></table>` : `<div class="empty">Nothing has happened yet.</div>`);
+
+  // roles — what exists, what it is for, what it runs on, what it has cost
+  const rs = (s.roles && s.roles.length) ? s.roles : (s.role_stats || []);
+  setHTML("rolestats", rs.length ? `
+    <table><thead><tr><th>role</th><th>what it does</th><th>model</th><th>runs</th><th>failed</th><th>total</th><th>avg</th></tr></thead><tbody>
+    ${rs.map(r => `<tr>
+      <td><span class="badge ${roleClass(r.role)}">${esc(r.role)}</span>
+          ${(r.busy || []).length ? `<div class="chip" style="color:var(--ok);margin-top:4px">working ${esc((r.busy || []).join(", "))}</div>` : ""}
+          ${r.installed === false ? `<div class="chip" style="color:var(--warn);margin-top:4px">not installed</div>` : ""}</td>
+      <td><div style="white-space:normal;max-width:62ch">${esc(r.description || "—")}</div></td>
+      <td class="mono dim">${esc(r.model || "?")}${r.effort ? `<div class="dim">effort ${esc(r.effort)}</div>` : ""}</td>
+      <td>${r.runs || 0}</td>
+      <td>${r.failures ? `<span style="color:var(--bad)">${r.failures}</span>` : "0"}</td>
+      <td class="mono">$${(r.cost || 0).toFixed(4)}</td>
+      <td class="mono">${r.runs ? `$${(r.avg_cost || 0).toFixed(4)}<div class="dim">${dur(Math.round(r.avg_seconds || 0))}</div>` : "–"}</td>
+    </tr>`).join("")}
+    </tbody></table>` : `<div class="empty">No roles configured.</div>`);
+
+  // logs — including finished boxes, which is when you most want to read one
+  setHTML("logs", s.logs.length ? `
+    <table><thead><tr><th>box</th><th>last write</th><th>size</th><th></th></tr></thead><tbody>
+    ${s.logs.map(l => `<tr>
+      <td class="mono" style="word-break:break-all">${esc(l.box)}</td>
+      <td class="dim">${ago(l.when)}</td>
+      <td class="dim">${(l.size / 1024).toFixed(1)} kB</td>
+      <td><button onclick="showLog(${jsq(l.box)})">open</button></td>
+    </tr>`).join("")}
+    </tbody></table>` : `<div class="empty">No box has run yet.</div>`);
+
+  // pending memory — proposals, with the accept/drop that used to be terminal-only
   document.getElementById("pendingcount").textContent = s.pending.length ? `(${s.pending.length})` : "";
-  document.getElementById("pending").innerHTML = s.pending.length ? s.pending.map(p => `
+  setHTML("pendingnote", can("memory-accept")
+    ? `Accepting routes a proposal into its tier. <code>claude-box harness memory</code> does the same from a terminal.`
+    : actionsStale
+      ? `This server predates the accept action — restart it (<code>claude-box harness ui --actions</code>) or run <code>claude-box harness memory</code>.`
+      : `Acceptance needs actions enabled — start with <code>claude-box harness ui --actions</code>, or run <code>claude-box harness memory</code>.`);
+  setHTML("pending", s.pending.length ? s.pending.map(p => `
     <div class="card">
       <div class="card-head">
         <span class="badge ${p.tier === "global" ? "pm" : "dev"}">${esc(p.tier || "no tier")}</span>
         ${p.repo ? `<span class="chip">${esc(p.repo)}</span>` : ""}
+        <span class="mono dim" style="margin-left:auto;font-size:11px">${esc(p.file)}</span>
       </div>
-      <div>${esc(p.body)}</div>
+      <div class="md" style="font-size:13px">${md(p.preview || p.body)}</div>
       <div class="note mono">evidence: ${esc(p.evidence || "—")}</div>
-    </div>`).join("") : `<div class="empty">Nothing proposed yet.</div>`;
+      <div style="margin-top:10px;display:flex;gap:8px">
+        <button onclick="showMemory('pending',${jsq(p.file)})">read</button>
+        ${can("memory-accept") ? `<button onclick="act('memory-accept',${jsq(p.file)})">accept</button>
+        <button onclick="act('memory-drop',${jsq(p.file)})">drop</button>` : ""}
+      </div>
+    </div>`).join("") : `<div class="empty">Nothing proposed yet.</div>`);
+
+  // memory — what agents actually read on their next run
+  const mem = s.memory || { global: [], repo: [], kb: { index: "", docs: [] } };
+  const entries = [...(mem.global || []), ...(mem.repo || [])];
+  document.getElementById("memcount").textContent = entries.length ? `(${entries.length} accepted)` : "";
+  setHTML("memory", (entries.length || mem.kb.index) ? `
+    <table><thead><tr><th>tier</th><th>where</th><th>content</th></tr></thead><tbody>
+    ${entries.map(e => `<tr style="cursor:pointer" onclick="showMemory('${e.tier === "global" ? "global" : "repo"}',${jsq(e.path || e.file)})">
+      <td><span class="badge ${e.tier === "global" ? "pm" : "dev"}">${esc(e.tier)}</span></td>
+      <td class="mono dim" style="word-break:break-all">${esc(e.path || e.file)}</td>
+      <td><div class="md" style="font-size:13px;max-width:80ch">${md(e.preview || e.body)}</div>
+          <button onclick="event.stopPropagation();showMemory('${e.tier === "global" ? "global" : "repo"}',${jsq(e.path || e.file)})">read</button></td>
+    </tr>`).join("")}
+    ${mem.kb.index ? `<tr style="cursor:pointer" onclick="showMemory('kb','')">
+      <td><span class="badge other">kb</span></td>
+      <td class="mono dim">knowledge/index.md
+          <div class="dim">${(() => {
+            const k = (s.knowledge && s.knowledge.kinds) || {};
+            const parts = Object.keys(k).map(name => `${k[name].length} ${name}`);
+            // "0 findings, 0 runbooks" is information; a bare doc count hid an empty base.
+            return parts.length ? esc(parts.join(", ")) : `${(mem.kb.docs || []).length} doc(s)`;
+          })()}</div></td>
+      <td><div class="md" style="font-size:13px;max-width:80ch">${md((mem.kb.index || "").slice(0, 300))}</div>
+          <button onclick="event.stopPropagation();showMemory('kb','')">read</button></td>
+    </tr>` : ""}
+    </tbody></table>`
+    : `<div class="empty">Nothing accepted yet — proposals above become memory once you accept them.</div>`);
 
   // rejected intents
-  document.getElementById("rejected").innerHTML = s.rejected.length ? `
+  setHTML("rejected", s.rejected.length ? `
     <table><thead><tr><th>role</th><th>task</th><th>why it was refused</th></tr></thead><tbody>
     ${s.rejected.map(r => `<tr>
       <td class="mono">${esc(r.role)}</td>
       <td class="mono dim">${esc(r.task)}</td>
       <td>${esc(r.reason)}</td></tr>`).join("")}
-    </tbody></table>` : `<div class="empty">No refused dispatches.</div>`;
+    </tbody></table>` : `<div class="empty">No refused dispatches.</div>`);
 
-  // ticks
-  document.getElementById("ticks").innerHTML = s.ticks.length ? `
-    <table><thead><tr><th>tick</th><th>when</th><th>dispatched</th><th>refused</th><th>pending</th><th>violations</th></tr></thead><tbody>
-    ${s.ticks.map(t => `<tr>
-      <td class="mono">${esc(t.id)}</td>
-      <td class="dim">${ago(t.when)}</td>
-      <td>${esc(t.accepted)}</td>
-      <td>${esc(t.rejected)}</td>
-      <td>${esc(t.pending_memory)}</td>
-      <td>${t.violations.length
-        ? `<span class="badge qa">${t.violations.length} reverted</span>`
-        : `<span class="dim">–</span>`}</td></tr>`).join("")}
-    </tbody></table>` : `<div class="empty">No ticks recorded.</div>`;
+  // runs — ticks and `harness do` runs, with what each actually did
+  const runs = s.runs || [];
+  setHTML("ticks", runs.length ? `
+    <table><thead><tr><th>run</th><th>when</th><th>worked</th><th>refused</th><th>promoted</th><th>cost</th><th>flags</th></tr></thead><tbody>
+    ${runs.map(r => `<tr>
+      <td><span class="badge ${r.kind === "do" ? "dev" : "pm"}">${esc(r.kind)}</span>
+          <span class="mono dim">${esc(r.id)}</span></td>
+      <td class="dim">${ago(r.when)}${r.finished ? "" : " · running"}</td>
+      <td>${esc(r.dispatched ?? "0")}${r.done ? ` <span class="dim">(${esc(r.done)} done)</span>` : ""}</td>
+      <td>${esc(r.refused ?? "0")}</td>
+      <td>${r.promoted.length || `<span class="dim">–</span>`}</td>
+      <td class="mono">${r.cost_usd ? `$${r.cost_usd.toFixed(4)}` : `<span class="dim">–</span>`}</td>
+      <td>${r.violations.length ? `<span class="badge qa">${r.violations.length} reverted</span>` : ""}
+          ${r.blocked && r.blocked !== "0" ? `<span class="chip" style="color:var(--warn)">${esc(r.blocked)} blocked</span>` : ""}
+      </td></tr>`).join("")}
+    </tbody></table>` : `<div class="empty">Nothing has run yet.</div>`);
 
-  document.getElementById("refreshed").textContent = "live · " + new Date().toLocaleTimeString();
+  setHTML("actionbar", can("tick")
+    ? `<button onclick="act('tick','')">run a tick</button>
+       ${can("purge-history") ? `<button onclick="actDanger('purge-history','','clear',${jsq("Clear activity, runs and box logs?")},${jsq("These are diagnostics under the state directory.\nYour projects, objectives, knowledge, git history and\npull requests are NOT touched. There is no undo.")})" title="delete box logs, per-box config dirs and run records">clear activity, runs and logs</button>` : ""}`
+    : actionsStale ? `<span class="pill" style="color:var(--warn)">restart the dashboard to enable actions</span>` : "");
+  const kb = s.knowledge || { kinds: {}, loose: [], total: 0 };
+  const kbRows = [];
+  for (const kind of Object.keys(kb.kinds || {})) {
+    for (const doc of kb.kinds[kind]) kbRows.push({ ...doc, kind });
+  }
+  for (const doc of kb.loose || []) kbRows.push({ ...doc, kind: "doc" });
+  n("knowledgecount", kbRows.length);
+  setHTML("knowledge", kbRows.length ? `
+    <table><thead><tr><th>kind</th><th>document</th></tr></thead><tbody>
+    ${kbRows.map(d => `<tr style="cursor:pointer" onclick="showKnowledge(${jsq(d.path)})">
+      <td><span class="badge ${roleClass(d.kind)}">${esc(d.kind)}</span></td>
+      <td><div class="t">${esc(d.title)}</div>
+          <div class="dim mono" style="word-break:break-all">${esc(d.path)}</div>
+          <div class="md" style="font-size:13px;max-width:80ch">${md(d.preview || "")}</div>
+          <button onclick="event.stopPropagation();showKnowledge(${jsq(d.path)})">read</button></td>
+    </tr>`).join("")}
+    ${kb.index ? `<tr style="cursor:pointer" onclick="showMemory('kb','')">
+      <td><span class="badge other">index</span></td>
+      <td><div class="t">knowledge/index.md</div>
+          <div class="md" style="font-size:13px;max-width:80ch">${md((kb.index || "").slice(0, 300))}</div></td>
+    </tr>` : ""}
+    </tbody></table>`
+    : `<div class="empty">Nothing catalogued yet. After qa approves a task the host dispatches one
+       <code>cataloguer</code> box, which writes a finding, service page or runbook here.</div>`);
+
+  const objs = s.objectives || [];
+  n("objectivescount", objs.length);
+  setHTML("objectives", objs.length ? `
+    <table><tbody>
+    ${objs.map(o => `<tr>
+      <td><div class="t">${esc(o.title)}</div>
+          <div class="dim mono">${esc(o.path)}</div>
+          <div class="md" style="margin-top:6px">${md(o.body || "")}</div></td>
+      <td style="white-space:nowrap;vertical-align:top">
+        ${o.status ? `<span class="chip">${esc(o.status)}</span>` : ""}
+        ${(o.projects || []).map(p => `<span class="chip">${esc(p.split("/")[2] || p)}</span>`).join("")}
+        ${can("delete-objective")
+          ? `<div style="margin-top:6px"><button onclick="actDanger('delete-objective',${jsq(o.file)},${jsq(o.file.replace(/\.md$/, ""))},${jsq(`Delete the objective ${o.title}?`)})" title="remove this objective document">delete</button></div>` : ""}
+      </td>
+    </tr>`).join("")}
+    </tbody></table>` : `<div class="empty">No objective documents yet. The project-manager writes
+      <code>objectives/&lt;project&gt;.md</code> when it drafts a project — a project without one is
+      work whose value nobody stated.</div>`);
+
+  n("projectscount", s.projects.length);
+  n("runscount", (s.runs || []).length, 15);
+  n("timelinecount", (s.timeline || []).length, 60);
+  n("logscount", s.logs.length, 40);
+  n("rejectedcount", s.rejected.length);
+
+  document.getElementById("refreshed").textContent = stale
+    ? `server is older than this page (api ${s.api} vs ${API_EXPECTED}) — restart: claude-box harness ui`
+    : "live · " + new Date().toLocaleTimeString();
+}
+
+// Re-rendering by innerHTML resets every scroll container to the top, so a poll landing
+// while you read the fourth card in "in-progress" yanked you back to the first. Snapshot
+// where each container (keyed by its id) is scrolled to, re-render, then put it back. The
+// page's own scroll position too — the drawer and the board both live below the fold.
+function keepScroll(fn) {
+  const pos = [];
+  document.querySelectorAll(".scroll, .col, .grid.bounded").forEach(el => {
+    if (el.id && el.scrollTop > 0) pos.push([el.id, el.scrollTop]);
+  });
+  const y = window.scrollY;
+  try {
+    fn();
+  } finally {
+    for (const [id, top] of pos) {
+      const el = document.getElementById(id);
+      // Content can shrink between polls; clamp rather than scroll past the end.
+      if (el) el.scrollTop = Math.min(top, Math.max(0, el.scrollHeight - el.clientHeight));
+    }
+    if (window.scrollY !== y) window.scrollTo(0, y);
+  }
 }
 
 async function poll() {
+  const badge = document.getElementById("refreshed");
   try {
-    render(await (await fetch("/api/state")).json());
+    const res = await fetch("/api/state");
+    const body = await res.json();
+    if (!res.ok) {
+      badge.textContent = `server error — ${(body.errors || ["see the terminal"])[0]}`;
+      return;
+    }
+    try {
+      keepScroll(() => render(body));
+    } catch (err) {
+      badge.textContent = `page error: ${err && err.message ? err.message : err}`;
+      console.error(err);
+      return;
+    }
+    if (body.errors && body.errors.length) {
+      badge.textContent = `partial — ${body.errors[0]}`;
+    }
+    if (body.api === undefined) {
+      badge.textContent = "server predates this page — restart: claude-box harness ui";
+    }
   } catch (e) {
-    document.getElementById("refreshed").textContent = "runner unreachable";
+    // The server is not answering at all: it was stopped, or never started on this port.
+    badge.textContent = `no server on this port — restart: claude-box harness ui`;
   }
 }
 
@@ -279,8 +826,298 @@ setInterval(() => {
   });
 }, 1000);
 
+// What the box has WRITTEN, not what it says. This is the honest answer to "is it stuck",
+// and it works even for a box that produces no log at all.
+async function act(action, arg) {
+  if (!ACTIONS_ON) return;
+  if (!confirm(`${action} ${arg || ""}?`)) return;
+  const body = document.getElementById("logbody");
+  document.getElementById("logname").textContent = `${action} ${arg || ""}`;
+  document.getElementById("drawer").classList.add("open");
+  body.textContent = "running…";
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CB-Token": ACTION_TOKEN },
+      body: JSON.stringify({ action, arg }),
+    });
+    const out = await res.json();
+    body.textContent = (out.ok ? "ok\n\n" : "failed\n\n") + (out.output || "");
+  } catch (e) {
+    body.textContent = "the request failed";
+  }
+  poll();
+}
+
+// Deleting is the one action here that destroys documents. A y/N dialog is muscle memory
+// by the third time you see it, so this one asks you to TYPE what you are deleting —
+// which you cannot do by accident, and cannot do at all on the wrong row.
+const DELETE_DETAIL = "This removes the documents, their worktrees and local branches.\n"
+  + "Open pull requests are NOT touched.\nA copy goes to the panel's trash directory.";
+async function actDanger(action, arg, phrase, what, detail) {
+  if (!ACTIONS_ON) return;
+  const typed = prompt(`${what}\n\n${detail || DELETE_DETAIL}\n\nType "${phrase}" to confirm:`);
+  if (typed !== phrase) return;
+  const body = document.getElementById("logbody");
+  document.getElementById("logname").textContent = `${action} ${arg || ""}`;
+  document.getElementById("drawer").classList.add("open");
+  body.textContent = "deleting…";
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CB-Token": ACTION_TOKEN },
+      body: JSON.stringify({ action, arg }),
+    });
+    const out = await res.json();
+    body.textContent = (out.ok ? "ok\n\n" : "failed\n\n") + (out.output || "");
+  } catch (e) {
+    body.textContent = "the request failed";
+  }
+  poll();
+}
+
+async function showDiff(taskId) {
+  openBox = null;
+  rawTask = null;
+  const seq = ++drawerSeq;
+  document.getElementById("logbody").classList.remove("md");
+  document.getElementById("logname").textContent = `diff — ${taskId}`;
+  const body = document.getElementById("logbody");
+  body.textContent = "reading the worktree…";
+  document.getElementById("drawer").classList.add("open");
+  try {
+    const text = await (await fetch(`/api/diff?task=${encodeURIComponent(taskId)}`)).text();
+    if (seq !== drawerSeq) return;
+    body.textContent = text;
+  } catch (e) {
+    if (seq !== drawerSeq) return;
+    body.textContent = "could not read the diff";
+  }
+}
+
+async function showProgress(taskId) {
+  openBox = null;
+  rawTask = null;
+  const seq = ++drawerSeq;
+  document.getElementById("logbody").classList.remove("md");
+  document.getElementById("logname").textContent = `files written — ${taskId}`;
+  const body = document.getElementById("logbody");
+  body.textContent = "reading the worktree…";
+  document.getElementById("drawer").classList.add("open");
+  try {
+    const p = await (await fetch(`/api/progress?task=${encodeURIComponent(taskId)}`)).json();
+    if (seq !== drawerSeq) return;
+    if (!p.exists) {
+      body.textContent = `no worktree at ${p.worktree} yet — the box has not started writing`;
+      return;
+    }
+    const changed = p.changed || [];
+    body.textContent =
+      `repo ${p.repo || "?"}   worktree ${p.worktree}\n`
+      + `${changed.length} file(s) changed according to git`
+      + (p.newest ? `, newest ${dur(Math.max(0, Math.round(Date.now() / 1000 - p.newest)))} ago` : "")
+      + "\n\n"
+      + (changed.length
+          ? changed.map(c => `  ${c.code.padEnd(2)}  ${(c.when ? dur(Math.max(0, Math.round(Date.now() / 1000 - c.when))) + " ago" : "").padStart(9)}  ${c.path}`).join("\n")
+          : "  (nothing changed yet)")
+      + (p.commits && p.commits.length ? `\n\ncommits on this branch\n` + p.commits.map(c => "  " + c).join("\n") : "")
+      + (p.diffstat ? `\n\n${p.diffstat}` : "");
+  } catch (e) {
+    if (seq !== drawerSeq) return;
+    body.textContent = "could not read the worktree";
+  }
+}
+
+// Markdown, rendered safely. Task documents are written by AGENTS, and this page carries
+// an action token — so everything is HTML-escaped FIRST and only then given structure.
+// No raw HTML from a document ever reaches the DOM, and links are limited to http(s).
+function md(src) {
+  if (!src) return "";
+  const lines = esc(src).split("\n");
+  let out = "", inCode = false, listType = null;
+  const closeList = () => { if (listType) { out += `</${listType}>`; listType = null; } };
+  const inline = (t) => t
+    .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, "");
+    if (/^```/.test(line)) {
+      closeList();
+      out += inCode ? "</code></pre>" : "<pre><code>";
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { out += line + "\n"; continue; }
+    if (!line.trim()) { closeList(); continue; }
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      closeList();
+      const level = Math.min(m[1].length + 1, 4);
+      out += `<h${level}>${inline(m[2])}</h${level}>`;
+    } else if (/^(---|\*\*\*|___)\s*$/.test(line)) {
+      closeList(); out += "<hr>";
+    } else if ((m = line.match(/^\s*&gt;\s?(.*)$/))) {
+      closeList(); out += `<blockquote>${inline(m[1])}</blockquote>`;
+    } else if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+      if (listType !== "ul") { closeList(); out += "<ul>"; listType = "ul"; }
+      out += `<li>${inline(m[1])}</li>`;
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      if (listType !== "ol") { closeList(); out += "<ol>"; listType = "ol"; }
+      out += `<li>${inline(m[1])}</li>`;
+    } else {
+      closeList(); out += `<p>${inline(line)}</p>`;
+    }
+  }
+  closeList();
+  if (inCode) out += "</code></pre>";
+  return out;
+}
+
+let rawTask = null;
+// Bumped by every drawer open: a response that lands after the drawer moved on is dropped.
+let drawerSeq = 0;
+
+// Read a memory document in full. The cards showed a preview, which is enough to know
+// something exists and not enough to decide whether to accept it.
+// A card you cannot open is a filename. Knowledge docs are the curated layer — the one you
+// actually want to read — so they open in the same drawer as memory and logs.
+function showKnowledge(path) {
+  const kb = (state && state.knowledge) || { kinds: {}, loose: [] };
+  const all = [].concat(...Object.keys(kb.kinds || {}).map(k => kb.kinds[k]), kb.loose || []);
+  const doc = all.find(d => d.path === path);
+  if (!doc) return;
+  openBox = null; rawTask = null; ++drawerSeq;
+  document.getElementById("logname").textContent = doc.path;
+  const body = document.getElementById("logbody");
+  body.classList.add("md");
+  body.innerHTML = `<div class="meta"><span class="chip">knowledge</span>
+    <span class="chip mono">${esc(doc.path)}</span></div>` + md(doc.body || "");
+  document.getElementById("drawer").classList.add("open");
+}
+
+function showMemory(kind, key) {
+  const mem = (state && state.memory) || { global: [], repo: [] };
+  const pool = kind === "pending" ? (state.pending || [])
+             : kind === "global" ? (mem.global || [])
+             : kind === "repo" ? (mem.repo || [])
+             : [];
+  const entry = kind === "kb"
+    ? { file: "knowledge/index.md", tier: "kb", body: (mem.kb && mem.kb.index) || "" }
+    : pool.find(e => (e.path || e.file) === key || e.file === key);
+  if (!entry) return;
+  openBox = null; rawTask = null; ++drawerSeq;
+  document.getElementById("logname").textContent = entry.path || entry.file;
+  const body = document.getElementById("logbody");
+  body.classList.add("md");
+  body.innerHTML =
+    `<div class="meta">
+       <span class="chip">${esc(entry.tier || kind)}</span>
+       ${entry.repo ? `<span class="chip">${esc(entry.repo)}</span>` : ""}
+       ${entry.evidence ? `<span class="chip">evidence: ${esc(entry.evidence)}</span>` : ""}
+     </div>`
+    + md(entry.body || "(empty)")
+    + (kind === "pending" && ACTIONS_ON
+        ? `<p><button onclick="act('memory-accept',${jsq(entry.file)})">accept into ${esc(entry.tier || "?")}</button>
+             <button onclick="act('memory-drop',${jsq(entry.file)})">drop</button></p>` : "");
+  document.getElementById("drawer").classList.add("open");
+}
+
+function showTask(path) {
+  const t = (state.tasks || []).find(x => x.path === path);
+  if (!t) return;
+  openBox = null; ++drawerSeq;
+  rawTask = t;
+  document.getElementById("logname").innerHTML =
+    `${esc(t.title)} <button style="margin-left:10px" onclick="toggleRaw()">raw</button>`;
+  renderTask(t, false);
+  document.getElementById("drawer").classList.add("open");
+}
+
+function toggleRaw() {
+  if (rawTask) renderTask(rawTask, !document.getElementById("logbody").classList.contains("md") ? false : true);
+}
+
+function renderTask(t, raw) {
+  const body = document.getElementById("logbody");
+  if (raw) {
+    body.classList.remove("md");
+    body.textContent = `${t.abs}\n\n` + (t.body || "(no body)");
+    return;
+  }
+  body.classList.add("md");
+  const chip = (label, value, cls) => value
+    ? `<span class="chip"${cls ? ` style="color:var(--${cls})"` : ""}>${esc(label)} ${esc(value)}</span>` : "";
+  const criteria = (t.criteria || []).map((c, i) =>
+    `<div class="crit"><span class="n">${i + 1}</span><span>${md(c).replace(/^<p>|<\/p>$/g, "")}</span></div>`).join("");
+  const questions = (t.questions || []).map(q => {
+    const cut = q.indexOf(" --- ");
+    const answered = cut > -1;
+    const ask = answered ? q.slice(0, cut) : q;
+    const ans = answered ? q.slice(cut + 5) : "";
+    return `<div class="qa${answered ? " answered" : ""}">${md(ask).replace(/^<p>|<\/p>$/g, "")}`
+      + (answered ? `<span class="ans">→ ${esc(ans)}</span>` : "") + `</div>`;
+  }).join("");
+  const prs = (t.pr_status || []).map(p =>
+    `<li><a href="${esc(p.url || "#")}" target="_blank" rel="noopener noreferrer">PR #${esc(p.number ?? "?")}</a>`
+    + ` — ${esc(p.state || "?")}${p.isDraft ? ", draft" : ""}`
+    + (p.ci ? `, CI <strong>${esc(p.ci === "none-ran" ? "no job ran" : p.ci)}</strong>${p.ci_detail ? ` (${esc(p.ci_detail)})` : ""}` : "")
+    + ((p.caused_here || []).length ? `<div style="font-size:12px;color:var(--bad)">caused by this change: ${esc((p.caused_here || []).join(", "))}</div>` : "")
+    + ((p.pre_existing || []).length ? `<div class="dim" style="font-size:12px">already failing on ${esc(p.baseRefName || "the base")}: ${esc((p.pre_existing || []).join(", "))}</div>` : "")
+    + ((p.passing_checks || []).length ? `<div class="dim" style="font-size:12px">passed: ${esc((p.passing_checks || []).join(", "))}</div>` : "")
+    + ((p.failing_checks || []).length ? `<div style="font-size:12px;color:var(--bad)">failed: ${esc((p.failing_checks || []).join(", "))}</div>` : "")
+    + `${p.changedFiles ? `, ${esc(p.changedFiles)} file(s) +${esc(p.additions ?? 0)}/-${esc(p.deletions ?? 0)}` : ""}</li>`).join("");
+
+  body.innerHTML =
+    `<div class="meta">
+       ${chip("status", t.status, t.status === "blocked" ? "bad" : t.status === "done" ? "ok" : "")}
+       ${chip("project", t.project)}${chip("repo", t.repo)}
+       ${chip("assignee", t.assignee)}${chip("qa", t.qa)}${chip("arch", t.arch)}
+       ${t.jira ? (jiraUrl(t.jira)
+          ? `<a class="chip" href="${esc(jiraUrl(t.jira))}" target="_blank" rel="noopener noreferrer">${esc(t.jira)}</a>`
+          : `<span class="chip">${esc(t.jira)}</span>`) : ""}
+     </div>`
+    + (t.description ? `<p>${esc(t.description)}</p>` : "")
+    + (t.next_action ? `<h2>Next</h2><p>${esc(t.next_action)}</p>`
+        + (t.next_command ? `<pre><code>${esc(t.next_command)}</code></pre>` : "") : "")
+    + (t.status === "blocked" && (t.blocked_reason || t.why)
+        ? `<h2>Why it is blocked</h2><div class="qa">${esc(t.blocked_reason || t.why)}</div>` : "")
+    + (questions ? `<h2>Waiting on you</h2>${questions}` : "")
+    + (criteria ? `<h2>Acceptance criteria</h2>${criteria}` : "")
+    + (prs ? `<h2>Pull requests</h2><ul>${prs}</ul>` : "")
+    + ((t.depends_on || []).length ? `<h2>Depends on</h2><ul>${t.depends_on.map(d => `<li><code>${esc(d)}</code></li>`).join("")}</ul>` : "")
+    + (t.body ? `<h2>Document</h2>${md(t.body)}` : "")
+    + `<p class="note mono">${esc(t.abs || t.path)}</p>`;
+}
+
+// The drawer's height is a preference, not state: whoever is reading a long task document
+// wants it big for the next one too.
+function applyDrawerHeight() {
+  const tall = store.get("cb-drawer-tall") === "1";
+  document.getElementById("drawer").classList.toggle("tall", tall);
+  const button = document.getElementById("drawersize");
+  if (button) button.textContent = tall ? "shrink" : "expand";
+}
+function toggleDrawerHeight() {
+  store.set("cb-drawer-tall",
+    store.get("cb-drawer-tall") === "1" ? "0" : "1");
+  applyDrawerHeight();
+}
+applyDrawerHeight();
+
+// Escape closes it — a drawer you can only dismiss by finding a small button is a drawer that
+// stays open over the board.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeLog();
+});
+
 async function showLog(name) {
-  openBox = name;
+  openBox = name; ++drawerSeq;
+  rawTask = null;
+  document.getElementById("logbody").classList.remove("md");
   document.getElementById("logname").textContent = name;
   document.getElementById("drawer").classList.add("open");
   await tailLog();
@@ -288,10 +1125,14 @@ async function showLog(name) {
 async function tailLog() {
   if (!openBox) return;
   const body = document.getElementById("logbody");
+  const box = openBox, seq = drawerSeq;
   const atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
   try {
-    body.textContent = await (await fetch(`/api/log?box=${encodeURIComponent(openBox)}`)).text();
+    const text = await (await fetch(`/api/log?box=${encodeURIComponent(box)}`)).text();
+    if (openBox !== box || seq !== drawerSeq) return;
+    body.textContent = text;
   } catch (e) {
+    if (openBox !== box || seq !== drawerSeq) return;
     body.textContent = "log unavailable";
   }
   if (atBottom) body.scrollTop = body.scrollHeight;
@@ -303,6 +1144,15 @@ function closeLog() {
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeLog(); });
 
 poll();
+// Which sections you closed is a preference, not state: a page that reopens everything on
+// every reload is a page you fight. `details` fires `toggle` for both directions.
+for (const d of document.querySelectorAll("details.sec[id]")) {
+  const key = "cb-sec:" + d.id;
+  const saved = store.get(key);
+  if (saved !== null) d.open = saved === "1";
+  d.addEventListener("toggle", () => store.set(key, d.open ? "1" : "0"));
+}
+
 setInterval(poll, 3000);
 setInterval(tailLog, 2000);
 </script>

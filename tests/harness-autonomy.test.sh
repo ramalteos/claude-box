@@ -53,7 +53,7 @@ FAKE_GH="$SANDBOX/gh"
 cat > "$FAKE_GH" <<'GHEOF'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "pr view")   printf '%s\n' "${GH_STATE-OPEN MERGEABLE}" ;;
+  "pr view")   printf '%s\n' "${GH_STATE-OPEN MERGEABLE draft=false}" ;;
   "pr checks") printf '%s\n' "${GH_CHECKS-SUCCESS}" ;;
   "pr merge")  printf '%s\n' "$3" >> "$SANDBOX/merged.log" ;;
   *) exit 0 ;;
@@ -108,8 +108,13 @@ GH_CHECKS="SUCCESS,PENDING" autonomy_merge full >/dev/null 2>&1
 assert_fails "a pending check blocks the merge" grep -q . "$SANDBOX/merged.log"
 
 : > "$SANDBOX/merged.log"
-GH_STATE="CLOSED UNKNOWN" autonomy_merge full >/dev/null 2>&1
+GH_STATE="CLOSED UNKNOWN draft=false" autonomy_merge full >/dev/null 2>&1
 assert_fails "a closed PR is not merged" grep -q . "$SANDBOX/merged.log"
+
+# A draft is how a role hands over work it could not fully verify — it must never merge.
+: > "$SANDBOX/merged.log"
+GH_STATE="OPEN MERGEABLE draft=true" autonomy_merge full >/dev/null 2>&1
+assert_fails "a draft PR is not merged" grep -q . "$SANDBOX/merged.log"
 
 : > "$SANDBOX/merged.log"
 for i in 1 2 3 4 5; do

@@ -33,16 +33,44 @@ tasks in the same repo at the same time.
    The repos root is the same path inside your box as on the host.
 2. **Detect the default branch** — `git -C <repo> symbolic-ref refs/remotes/origin/HEAD`
    or `gh repo view --json defaultBranchRef`. Do not assume `main`.
-3. **Work in your own worktree**, never in the repo's main working tree:
-   `git -C <repo> worktree add -b <branch> <reposRoot>/_wt/<task-id> <base>`.
-   Branch name: `<role>/<task-id>-<short-slug>`.
-4. **Use a private package store** so a sibling box's install cannot corrupt yours:
-   `pnpm install --store-dir <worktree>/.pnpm-store`.
-5. **Push early**, then keep pushing. A box that dies with unpushed commits has lost
-   the work.
-6. **Conventional commits** (`feat:`, `fix:`, `chore:`, `docs:`, `test:`). No AI
-   attribution, no co-author trailers, no `--no-verify` — the pre-commit hook is there on
-   purpose.
+3. **Your worktree is created for you — do not create one.** The harness makes it before
+   your box starts, at `<reposRoot>/_wt/<project-slug>-<task-id>`, on a branch named for the
+   change (`<project-slug>/<task-id>-<slug>`), based on `origin/<default-branch>`. Its path
+   and branch are given to you in your instructions. Work there.
+
+   If you ever do create one: **never inside the repository.** A worktree at
+   `<repo>/_wt/...` turns the entire checkout into thousands of untracked files on the
+   human's main branch — this happened, and it cost a whole run.
+
+4. **Use the store that is already configured. Never pass `--store-dir`.**
+   `~/.npmrc` in the box points pnpm at a store on the mounted workspace, shared across
+   boxes and warm between runs, on the same filesystem as `node_modules` so pnpm hardlinks
+   instead of copying. A private per-worktree store forces a **cold download of the entire
+   dependency tree on every task** — for a monorepo that is many minutes of pure waste, and
+   it was the single biggest time sink in early runs. pnpm locks its own store; concurrent
+   installs are safe.
+
+   Install the narrowest scope that works: `pnpm install --filter <app>...` rather than a
+   full workspace install. And never `git checkout -- pnpm-lock.yaml` followed by a fresh
+   full install to "clean up" — that throws away the warm state and rebuilds from nothing.
+5. **Push early, then open the pull request immediately** — as a draft, before the work is
+   finished. Then keep committing and pushing to it. A box can time out, hit a rate limit
+   or be stopped; if the PR only gets opened at the end, all of that becomes invisible work
+   on a branch nobody looks at. A draft PR that grows is strictly better than a perfect PR
+   that never happens.
+6. **Conventional commits** (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `ci:`). No AI
+   attribution, no co-author trailers.
+
+   **When a repo's own git hook cannot run in a box.** Many repos install husky hooks that
+   assume a developer laptop — `brew install gitleaks`, a GUI keychain, a VPN — and they
+   replace ours, so they hang or fail here through no fault of your change. If a hook fails
+   for an environmental reason (a missing tool the box cannot install, a network fetch, a
+   timeout), retry once, then commit with `--no-verify` and **say so in the PR body**,
+   naming the hook and the error. Secrets are still caught: claude-box's pre-push hook
+   scans on every push regardless of what the repo's hooks did.
+
+   Never use `--no-verify` to get past a hook that is failing **because of your change** —
+   a lint error, a type error, a real secret. That is the hook doing its job.
 7. **Stage by explicit path. Never `git add -A` or `git add .`.** Commit the files the
    task needed and nothing else. Planning notes, spec documents, task copies, scratch
    files and anything under `.harness/`, `_wt/`, `docs/superpowers/` or `.pnpm-store/` is
@@ -73,24 +101,57 @@ one outright.
 
 ## Stacked pull requests
 
-When a task's change is genuinely a chain — a refactor that enables a feature, a schema
-change before the code that uses it — do not ship one large PR and do not ship two
-unrelated ones. Use `gh stack` (the extension is in the image):
+Two different situations, and they are handled differently.
+
+**A task that depends on another task.** The harness reads `depends_on` and bases your
+worktree on that dependency's branch when it is not merged yet. Your instructions name the
+base. When the base is not the repository's default branch, this is a **stacked PR**:
 
 ```sh
-gh stack init                 # start a stack on the default branch
-# commit the first slice, then:
-gh stack add <next-branch>    # a branch on top of the current stack
-gh stack submit               # push every branch and open/update the PRs
-gh stack view                 # see the chain
-gh stack sync                 # after the bottom PR merges or trunk moves
+gh pr create --base <the base branch named in your instructions> --draft   # if blocked
 ```
 
-Each PR in the stack must stand on its own: its own description, its own tests green, and
-a body that says which PR it sits on top of. Reviewers read the bottom first.
+Getting this wrong is the common failure: opening it against the default branch instead makes
+your PR contain the dependency's work as well, so a reviewer sees a pile of two changes and
+cannot tell whose is whose. Say in the body which PR yours sits on top of, and that it should
+be merged after it.
+
+**One task whose own change is a chain** — a refactor that enables the feature, a schema
+change before its consumer. Build it as a local stack:
+
+```sh
+gh stack init                 # start a stack on the base branch
+gh stack add <next-branch>    # a branch on top of the current stack
+gh stack submit               # push every branch and open/update the PRs
+gh stack view / gh stack sync
+```
+
+Each PR in the chain stands on its own: its own description, its own green tests, and a note
+saying which PR it sits on. Reviewers read the bottom first.
 
 `gh stack merge` exists — **do not use it.** Merging is the human's, or the host's under
-autonomy. Submit the stack and report the PR URLs in the task's `pr:` list, bottom first.
+autonomy. Report every PR URL in the task's `pr:` list, bottom first.
+
+## Jira, when the panel has it enabled
+
+If `instance.config.json` has `jira.enabled: true` and your task carries a `jira:` key, keep
+that issue honest as you work. You have the Atlassian connector in your box; no token is
+needed.
+
+- **Starting**: transition the issue to In Progress. Read the available transitions first —
+  do not guess a status name that this project's workflow does not have.
+- **Opening a PR**: transition to In Review (or the nearest equivalent) and comment with the
+  PR link and one line on what to look at. If it is a draft, say what is still blocked.
+- **Blocked**: comment with the reason and what would unblock it. Say it in the issue, not
+  only in the task document — the issue is what a human is watching.
+- **Never**: close an issue yourself, paste a secret or customer data into a ticket, or open
+  a new issue for work that already has one.
+
+Nor do you mark your own draft PR ready for review. The host does that once qa has approved and
+CI is not failing — marking your own work ready is the review equivalent of merging it.
+
+If the task has no `jira:` key, do not create an issue — that is the project-manager's job,
+and two roles creating tickets produces duplicates.
 
 ## Learnings
 

@@ -16,6 +16,12 @@
 HARNESS_DIR="$SETUP_DIR/harness"
 # Per-box wall-clock limit. A wedged agent must not hold a dispatch slot forever.
 CLAUDE_BOX_ROLE_TIMEOUT="${CLAUDE_BOX_ROLE_TIMEOUT:-2700}"      # 45 min
+CLAUDE_BOX_TASK_ATTEMPTS="${CLAUDE_BOX_TASK_ATTEMPTS:-3}"        # timeouts before a task blocks
+CLAUDE_BOX_STALL_TIMEOUT="${CLAUDE_BOX_STALL_TIMEOUT:-420}"      # 7 min of silence = stuck; 0 disables
+# Review rounds per run. Two was a spend cap, and it read as abandonment: a task with a real
+# finding was handed back once and then left in-review while the run walked to the next task.
+# The point of a budget is to bound a loop that is not converging, not to stop work that is.
+CLAUDE_BOX_QA_ROUNDS="${CLAUDE_BOX_QA_ROUNDS:-10}"
 # Cap on the assembled memory preamble. Memory that eats the context window makes
 # every role worse at the job the memory was supposed to help with.
 CLAUDE_BOX_MEMORY_MAX="${CLAUDE_BOX_MEMORY_MAX:-8000}"          # characters
@@ -127,7 +133,46 @@ container_path() { printf '%s\n' "$CONTAINER_WS${1#"$ROOT"}"; }
 # spending one, and check the output afterwards.
 require_login() {
   [ -n "${ANTHROPIC_API_KEY:-}" ] && return 0
-  [ -f "$CONFIG_HOME/.credentials.json" ] && return 0
+  if [ -f "$CONFIG_HOME/.credentials.json" ]; then
+    # The file existing is not the same as the session working. A box that refreshes the token
+    # writes the credential back, and one such write landed without `expiresAt` — after which
+    # every box read it as expired, failed to refresh, and died in 80ms. Say so before
+    # spending a container per task.
+    local verdict
+    verdict="$(python3 - "$CONFIG_HOME/.credentials.json" <<'PY_CRED'
+import json, sys, time
+try:
+    oauth = (json.load(open(sys.argv[1])) or {}).get("claudeAiOauth") or {}
+except Exception:
+    print("unreadable"); raise SystemExit
+if not oauth:
+    print("ok"); raise SystemExit                      # an API-key or other shape: not ours to judge
+refresh = oauth.get("refreshTokenExpiresAt")
+if refresh and refresh / 1000 < time.time():
+    print("refresh-expired"); raise SystemExit
+expires = oauth.get("expiresAt")
+if expires is None:
+    print("no-expiry"); raise SystemExit
+print("expired" if expires / 1000 < time.time() else "ok")
+PY_CRED
+)"
+    case "$verdict" in
+      (ok) return 0 ;;
+      (no-expiry|expired)
+        note "the shared Claude credential looks stale ($verdict) — a box may fail to authenticate.
+    If boxes die instantly, log in again: claude-box, then /login." ;;
+      (refresh-expired)
+        die "the shared Claude session has expired and cannot refresh itself.
+
+Log in once, in your own terminal (it needs a TTY):
+
+  claude-box            # then /login, then exit
+
+Credentials live in $CONFIG_HOME and every box shares them." ;;
+      (*) ;;
+    esac
+    return 0
+  fi
   die "the sandbox has no Claude login yet, so every box would exit without doing anything.
 
 Log in once, in your own terminal (it needs a TTY, so this cannot be done for you):
@@ -138,22 +183,43 @@ Credentials persist in $CONFIG_HOME and every box shares them. Alternatively, ex
 ANTHROPIC_API_KEY before running the harness."
 }
 
+# An expired OAuth session kills every box in the run in about 80ms each, and the host used to
+# read each empty exit as "no pull request — task blocked": one dead credential rewrote nine
+# task documents. This is the check that stops a run instead of spending it.
+box_auth_failed() {
+  local log="$1"
+  [ -f "$log" ] || return 1
+  # A content grep over stream-json: a healthy box that READS these words (this repo's own
+  # source, a tool result quoting an error) echoes them into its log. Only a run that never
+  # reported completion gets to be judged on them.
+  grep -q '"terminal_reason":"completed"' "$log" && return 1
+  grep -qiE '"error":"authentication_failed"|OAuth session expired|Failed to authenticate|please run /login' "$log"
+}
+
 # Did this box actually run, or did it fall out for a reason that is not the task's fault?
 # Returns a human-readable reason, or nothing when the box looks healthy.
 box_failure_reason() {
   local log="$1" code="$2"
   [ -f "$log" ] || { printf 'the box produced no log at all\n'; return 0; }
-  if grep -qiE 'not logged in|please run /login|invalid api key|authentication_error' "$log"; then
-    printf 'the box is not logged in — run `claude-box` in a terminal, /login, then retry\n'
-    return 0
-  fi
-  if grep -qiE 'credit balance|quota|rate.?limit|overloaded' "$log"; then
-    printf 'the API refused the request (credit, quota or rate limit) — see the log\n'
-    return 0
+  # These two are CONTENT greps over a stream-json log, so they only get to speak about a run
+  # that did not report completion. A perfectly healthy stream carries `rateLimitTier` in its
+  # init line and `rate_limit` in its policy metadata, which `rate.?limit` matched — and because
+  # the greps sat above the exit-code check, an exit 0 could not clear them. A whole fold-in that
+  # cleared every open question was reported as "the API refused the request".
+  if ! grep -q '"terminal_reason":"completed"' "$log"; then
+    if grep -qiE 'not logged in|please run /login|invalid api key|authentication_error|authentication_failed|OAuth session expired|Failed to authenticate' "$log"; then
+      printf 'the box could not authenticate — run `claude-box` in a terminal, /login, then retry\n'
+      return 0
+    fi
+    if grep -qiE 'credit balance|quota|rate.?limit|overloaded' "$log"; then
+      printf 'the API refused the request (credit, quota or rate limit) — see the log\n'
+      return 0
+    fi
   fi
   case "$code" in
     0|'') ;;
     timeout) printf 'the box hit the %ss timeout\n' "$CLAUDE_BOX_ROLE_TIMEOUT"; return 0 ;;
+    stalled) printf 'the box stopped producing output for %ss and was stopped\n' "$CLAUDE_BOX_STALL_TIMEOUT"; return 0 ;;
     gone)    printf 'the box vanished without reporting\n'; return 0 ;;
     *)       printf 'the box exited %s\n' "$code"; return 0 ;;
   esac
@@ -213,12 +279,20 @@ memory_preamble() {
     out="$out""_(no knowledge base in this instance)_"$'\n'
   fi
 
-  if [ -n "$repo" ] && [ -d "$ROOT/$repo/.harness/memory" ]; then
-    out="$out"$'\n'"### Repo-local ($repo) — wins over global"$'\n'
-    for f in "$ROOT/$repo/.harness/memory"/*.md "$ROOT/$repo/.harness/memory/learnings"/*.md; do
+  # Repo-scoped memory is the panel's. A repo that ships its own `.harness/memory` is still
+  # read — that is a team publishing learnings with its code — but the harness never writes
+  # there, so the human's working tree stays clean.
+  if [ -n "$repo" ]; then
+    local repo_mem=0 repo_out=""
+    for f in "$INSTANCE/memory/repos/$repo"/*.md \
+             "$ROOT/$repo/.harness/memory"/*.md "$ROOT/$repo/.harness/memory/learnings"/*.md; do
       [ -f "$f" ] || continue
-      out="$out"$'\n'"<!-- $(basename "$f") -->"$'\n'"$(cat "$f")"$'\n'
+      repo_out="$repo_out"$'\n'"<!-- $(basename "$f") -->"$'\n'"$(cat "$f")"$'\n'
+      repo_mem=1
     done
+    if [ "$repo_mem" = 1 ]; then
+      out="$out"$'\n'"### Repo-scoped ($repo) — wins over global"$'\n'"$repo_out"
+    fi
   fi
 
   # Truncate rather than let memory crowd out the task. Silent truncation would
@@ -276,6 +350,50 @@ repo_preamble() {
     printf 'human — ask it rather than guessing, because work in the wrong repository\n'
     printf 'costs a review cycle and a revert.\n'
   fi
+  local scopes; scopes="$(gh_scopes)"
+  if [ -n "$scopes" ]; then
+    printf '\n### What your GitHub token may write\n\nScopes: `%s`.\n' "$scopes"
+    if gh_has_scope workflow; then
+      printf '\nYou CAN add and change CI: put the job in `.github/workflows/`, in the same pull\n'
+      printf 'request as the code it proves. Nowhere else is CI.\n'
+    else
+      printf '\nYou CANNOT push `.github/workflows/**` — that needs the `workflow` scope, which this\n'
+      printf 'token lacks. Do not park a workflow file in a neighbouring directory: a YAML file\n'
+      printf 'Actions never reads is not CI, and a PR that ships one looks verified and is not.\n'
+      printf 'Write what the job would be under `## Blocked on` in the PR body, naming the file\n'
+      printf 'and the one command that unblocks it:\n\n'
+      printf '    gh auth refresh -h github.com -s workflow\n'
+    fi
+  fi
+}
+
+# The scopes on the token every box gets. A box cannot discover this for itself without
+# spending a turn on it, and not knowing cost a whole task: unable to push
+# `.github/workflows/**` (that needs the `workflow` scope), an agent invented
+# `.github/e2e-workflows-staged/` and shipped a PR whose CI proved nothing. Cached for an
+# hour — it is one API call, and the answer only changes when a human refreshes the token in
+# a browser, which is exactly the fix applied after a role reports it cannot push workflows.
+gh_scopes() {
+  local cache="$INSTANCE_STATE/gh-scopes"
+  if [ -f "$cache" ] && [ -n "$(cat "$cache" 2>/dev/null)" ] \
+     && [ $(( $(date +%s) - $(file_mtime "$cache") )) -lt 3600 ]; then
+    cat "$cache"; return 0
+  fi
+  mkdir -p "$INSTANCE_STATE"
+  local scopes=""
+  if command -v "$GH_BIN" >/dev/null 2>&1; then
+    # Lowercase the whole response first: the header arrives as `X-Oauth-Scopes` and awk's
+    # IGNORECASE is a gawk extension that macOS awk ignores in silence — which made this
+    # return nothing and every role prompt claim the token could not push CI.
+    scopes="$("$GH_BIN" api --include /user 2>/dev/null | tr 'A-Z' 'a-z' \
+                | sed -n 's/^x-oauth-scopes: *//p' | tr -d '\r' | head -1)"
+  fi
+  printf '%s\n' "$scopes" > "$cache"
+  printf '%s\n' "$scopes"
+}
+
+gh_has_scope() {
+  case ",$(gh_scopes | tr -d ' ')," in (*",$1,"*) return 0 ;; (*) return 1 ;; esac
 }
 
 # Code standards ship with claude-box so a change to them reaches every panel, rather
@@ -289,12 +407,36 @@ standards_doc() {
   fi
 }
 
+# A box that does not know its clock spends the whole budget exploring and gets killed with
+# the work on the floor: six of eight tasks in one run ended "timeout, no pull request". The
+# work survives in the worktree either way, but a pushed branch and a draft PR turn a
+# stopped box into resumable progress a human can read, so say the number out loud.
+time_budget_doc() {
+  local total=$((CLAUDE_BOX_ROLE_TIMEOUT / 60)) soft=$(( (CLAUDE_BOX_ROLE_TIMEOUT * 3 / 4) / 60 ))
+  cat <<EOF_TB
+## Your clock
+
+You have **${total} minutes** of wall clock. The box is stopped at that point, mid-sentence.
+
+At **${soft} minutes**, stop starting anything new:
+
+1. commit what works and push the branch,
+2. open (or update) the draft pull request,
+3. write what is left under \`## Blocked on\` in the PR body.
+
+A stopped box with a pushed branch and a draft PR is progress the next run continues from.
+A stopped box with everything uncommitted is a run nobody can read. Nothing is graded on
+using the full budget — finishing early is the better outcome.
+EOF_TB
+}
+
 role_system_prompt() {
   local role="$1" repo="${2:-}"
-  printf '%s\n\n---\n\n%s\n\n---\n\n%s\n\n---\n\n%s\n\n---\n\n%s\n' \
+  printf '%s\n\n---\n\n%s\n\n---\n\n%s\n\n---\n\n%s\n\n---\n\n%s\n\n---\n\n%s\n' \
     "$(strip_frontmatter "$INSTANCE/.claude/agents/$role.md")" \
     "$(cat "$HARNESS_DIR/overlay.md")" \
     "$(standards_doc)" \
+    "$(time_budget_doc)" \
     "$(repo_preamble "$repo")" \
     "$(memory_preamble "$repo")"
 }
@@ -489,7 +631,10 @@ cmd_role() {
   name="$(unique_name "$name")"
   log="$STATE_HOME/logs/$name.log"
 
-  local claude_args=(claude --permission-mode bypassPermissions --model "$model")
+  # stream-json, not text: the default prints nothing until the run ENDS, so a long box
+  # looks hung and its log holds one line. The stream is rendered by harness/render-log.py.
+  local claude_args=(claude --permission-mode bypassPermissions --model "$model"
+                     --output-format stream-json --verbose)
   local effort fallback
   effort="$(role_effort "$role" "$model")"
   [ -n "$effort" ] && claude_args+=(--effort "$effort")
@@ -530,11 +675,30 @@ cmd_role() {
 # --- waiting on boxes ---------------------------------------------------------
 # Poll an exit file rather than the engine, so this behaves the same on Docker,
 # Apple `container` and the fake engine used by the tests.
+# The third argument is the box's log, when the caller has one. A box that has stopped
+# producing output is not working — one lead-dev box sat for eleven minutes inside
+# `until [ -f <subagent output> ]`, spending the whole budget on a file that never
+# appeared. The hard timeout eventually caught it; a stall check catches it in minutes.
 wait_for_box() {
-  local name="$1" exit_file="$2" missing=0
+  local name="$1" exit_file="$2" log="${3:-}" missing=0
   local deadline=$(( $(date +%s) + CLAUDE_BOX_ROLE_TIMEOUT ))
+  local last_size=-1 last_change; last_change="$(date +%s)"
   while :; do
     [ -f "$exit_file" ] && return 0
+    # -f as well as -n: the log does not exist for the first second or two of a box, and
+    # `wc -c < missing` makes bash itself print "No such file or directory" with a line number,
+    # which looks like a harness crash in the middle of a run.
+    if [ -n "$log" ] && [ -f "$log" ] && [ "$CLAUDE_BOX_STALL_TIMEOUT" -gt 0 ]; then
+      local size; size="$(wc -c < "$log" 2>/dev/null | tr -d ' ')"; size="${size:-0}"
+      if [ "$size" != "$last_size" ]; then
+        last_size="$size"; last_change="$(date +%s)"
+      elif [ $(( $(date +%s) - last_change )) -ge "$CLAUDE_BOX_STALL_TIMEOUT" ]; then
+        note "$name wrote nothing for ${CLAUDE_BOX_STALL_TIMEOUT}s — stopping it"
+        box_is_running "$name" && engine_stop_box "$name"
+        printf '%s\n' stalled > "$exit_file"
+        return 1
+      fi
+    fi
     if box_is_running "$name"; then
       missing=0
     else
@@ -609,6 +773,10 @@ tick_body() {
   TICK_DIR="$INSTANCE_STATE/ticks/$TICK_ID"
   mkdir -p "$TICK_DIR/intents" "$TICK_DIR/logs" "$INSTANCE_STATE/exits" "$INSTANCE_STATE/inflight"
   note "tick $TICK_ID on $INSTANCE_SLUG (cap $(inflight_cap), in flight $(inflight_count))"
+  # Retention runs here rather than from a cron: a tick is the only thing guaranteed to
+  # happen regularly, and this is diagnostics rather than record.
+  local pruned; pruned="$(prune_history "$CLAUDE_BOX_HISTORY_DAYS" 2>/dev/null || echo 0)"
+  [ "${pruned:-0}" -gt 0 ] 2>/dev/null && note "pruned $pruned history item(s) older than ${CLAUDE_BOX_HISTORY_DAYS}d"
 
   local snap_pre="$TICK_DIR/status-pre.tsv" snap_mid="$TICK_DIR/status-mid.tsv" snap_post="$TICK_DIR/status-post.tsv"
   status_snapshot > "$snap_pre"
@@ -628,7 +796,8 @@ tick_body() {
   else
     resolve_target "$INSTANCE"
     EXTRA_RUN_ARGS=(-e IS_SANDBOX=1)
-    local pm_args=(claude --permission-mode bypassPermissions --model "$pm_model")
+    local pm_args=(claude --permission-mode bypassPermissions --model "$pm_model"
+                   --output-format stream-json --verbose)
     local pm_effort; pm_effort="$(role_effort project-manager "$pm_model")"
     [ -n "$pm_effort" ] && pm_args+=(--effort "$pm_effort")
     local pm_fallback; pm_fallback="$(cfg fallbackModel "")"
@@ -637,7 +806,7 @@ tick_body() {
       "${pm_args[@]}" \
       --append-system-prompt "$pm_sys" \
       -p "Run ONE tick of your project-manager procedure. Reconcile task documents against live git/gh state, refine drafts, and for every human-promoted 'ready' task write a dispatch intent file as described in your system prompt. Do not promote and do not merge. End with a short summary of deltas, dispatch intents written, and what awaits the human."
-    wait_for_box "$pm_name" "$pm_exit" || note "PM tick timed out"
+    wait_for_box "$pm_name" "$pm_exit" "$pm_log" || note "PM tick timed out"
     note "PM tick exit $(cat "$pm_exit" 2>/dev/null || echo unknown) — log: $pm_log"
     status_snapshot > "$snap_mid"
     revert_promotions "$snap_pre" "$snap_mid" project-manager
@@ -700,12 +869,19 @@ PY
     local nm
     while IFS= read -r nm; do
       [ -n "$nm" ] || continue
-      wait_for_box "$nm" "$INSTANCE_STATE/exits/$nm" || true
+      wait_for_box "$nm" "$INSTANCE_STATE/exits/$nm" "$STATE_HOME/logs/$nm.log" || true
     done <<< "$names"
     status_snapshot > "$snap_post"
     revert_promotions "$snap_mid" "$snap_post" "role boxes"
     autonomy_merge "$mode"
   fi
+
+  # Anything whose gates passed while we were elsewhere.
+  local rt
+  while IFS= read -r rt; do
+    [ -n "$rt" ] || continue
+    pr_ready_if_finished "$rt" "$(task_field "$INSTANCE/$rt" target_repo)"
+  done <<< "$(cd "$INSTANCE" && find projects -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort)"
 
   {
     printf 'tick %s\ninstance %s\naccepted %s\nrejected %s\n' \
@@ -808,10 +984,16 @@ memory_accept() {
       dst="$STATE_HOME/harness/memory/$(basename "$file")"
       ;;
     repo)
+      # Panel-owned, keyed by repo. Writing into the target repo put a dozen untracked files
+      # in the human's working tree of a monorepo nobody asked us to modify — the pollution
+      # without the sharing, since nothing ever committed them. The panel already holds
+      # projects, knowledge and the log, and it can be a git repo a team shares.
       [ -n "$repo" ] || { note "proposal has tier: repo but no repo: field — edit or drop it"; return 1; }
+      # A name, not a path: `..` passes the directory test and lands outside memory/repos.
+      case "$repo" in (.|..|/*|*/..|../*|*/../*) note "repo '$repo' is not a repo name — edit or drop it"; return 1 ;; esac
       [ -d "$ROOT/$repo" ] || { note "repo '$repo' not found under $ROOT"; return 1; }
-      mkdir -p "$ROOT/$repo/.harness/memory/learnings"
-      dst="$ROOT/$repo/.harness/memory/learnings/$(basename "$file")"
+      mkdir -p "$INSTANCE/memory/repos/$repo"
+      dst="$INSTANCE/memory/repos/$repo/$(basename "$file")"
       ;;
     *)
       note "proposal has no usable tier (want 'global' or 'repo', got '${tier:-none}') — edit or drop it"; return 1 ;;
@@ -820,19 +1002,61 @@ memory_accept() {
   cp "$file" "$dst"
   rm -f "$file"
   echo "accepted -> $dst"
-  [ "$tier" = repo ] && echo "  (commit it in $repo so it travels with the code)"
+  [ "$tier" = repo ] && echo "  (scoped to $repo; commit it in this panel to share it with your team)"
   return 0
 }
 
 cmd_harness_memory() {
-  local inst=""
+  local inst="" accept="" drop="" list=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --instance) inst="${2:-}"; shift 2 ;;
-      *) inst="$1"; shift ;;
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      # Non-interactive, so the dashboard can act through the same implementation rather
+      # than growing a second one.
+      --accept)           accept="${2:-}"; shift 2 ;;
+      --drop)             drop="${2:-}"; shift 2 ;;
+      --list)             list=1; shift ;;
+      -*)                 die "unknown flag for 'harness memory': $1" ;;
+      *)                  inst="$1"; shift ;;
     esac
   done
   resolve_instance "$inst"
+
+  # A proposal is named by its file, and only inside the pending directory.
+  if [ -n "$accept" ] || [ -n "$drop" ]; then
+    local target="${accept:-$drop}"
+    case "$target" in
+      (*/*|..*|"") die "give the proposal's file name only, e.g. --accept kafka-idempotency.md" ;;
+    esac
+    local file="$INSTANCE/.harness/pending/$target"
+    [ -f "$file" ] || die "no pending proposal named $target"
+    if [ -n "$drop" ]; then
+      rm -f "$file"
+      echo "dropped $target"
+      return 0
+    fi
+    memory_accept "$file"
+    return $?
+  fi
+
+  if [ "$list" = 1 ]; then
+    local f
+    echo "global ($STATE_HOME/harness/memory):"
+    for f in "$STATE_HOME/harness/memory"/*.md; do
+      [ -f "$f" ] && printf '  %s\n' "$(basename "$f")"
+    done
+    echo "repo-scoped:"
+    for f in "$INSTANCE"/memory/repos/*/*.md \
+             "$ROOT"/*/.harness/memory/learnings/*.md "$ROOT"/*/.harness/memory/*.md; do
+      [ -f "$f" ] || continue
+      printf '  %s\n' "${f#"$ROOT"/}"
+    done
+    echo "pending ($INSTANCE/.harness/pending):"
+    for f in "$INSTANCE/.harness/pending"/*.md; do
+      [ -f "$f" ] && printf '  %s  [%s]\n' "$(basename "$f")" "$(fm_field "$f" tier)"
+    done
+    return 0
+  fi
   local files=() f
   for f in "$INSTANCE/.harness/pending"/*.md; do [ -f "$f" ] && files+=("$f"); done
   [ "${#files[@]}" -eq 0 ] && { echo "no pending memory proposals"; return 0; }
@@ -867,19 +1091,22 @@ cmd_harness_memory() {
 
 # --- dashboard ----------------------------------------------------------------
 cmd_harness_ui() {
-  local port=7777 inst=""
+  local port=7777 inst="" actions=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --port)     port="${2:-}"; shift 2 ;;
       --instance) inst="${2:-}"; shift 2 ;;
+      --actions)  actions=1; shift ;;
       *)          inst="$1"; shift ;;
     esac
   done
   resolve_instance "$inst"
   command -v python3 >/dev/null 2>&1 || die "the dashboard needs python3 (macOS ships it)"
   note "dashboard on http://localhost:$port  (Ctrl-C to stop)"
+  [ "$actions" = 1 ] && note "actions ON — the page can stop boxes, promote tasks and run a tick"
   CB_INSTANCE="$INSTANCE" CB_INSTANCE_SLUG="$INSTANCE_SLUG" CB_STATE="$STATE_HOME" \
   CB_ROOT="$ROOT" CB_PORT="$port" CB_RUNNER="$SETUP_DIR/claude-box" \
+  CB_UI_ACTIONS="$actions" \
     exec python3 "$HARNESS_DIR/ui/server.py"
 }
 
@@ -982,17 +1209,15 @@ WARN2
 # guard stays on for everyone, so a role that writes `ready` is still caught and logged
 # even while the host is promoting freely.
 autonomy_promote() {
-  local mode="$1" f promoted=0 criteria questions status
+  local mode="$1" f promoted=0 status
   case "$mode" in promote|full) ;; *) return 0 ;; esac
   find "$INSTANCE/projects" -type f -name '*.md' 2>/dev/null | sort | while IFS= read -r f; do
     status="$(task_status "$f")"
     [ "$status" = draft ] || continue
     grep -q '^type: *Task' "$f" || continue
     # Refined means: testable criteria present, and nothing waiting on a human.
-    criteria="$(awk -F': *' '/^acceptance_criteria:/ { print $2; exit }' "$f")"
-    questions="$(awk -F': *' '/^open_questions:/ { print $2; exit }' "$f")"
-    case "$criteria" in ''|'[]'|'[ ]') continue ;; esac
-    case "$questions" in ''|'[]'|'[ ]') ;; *) continue ;; esac
+    [ "$(fm_list_count "$f" acceptance_criteria)" -gt 0 ] || continue
+    [ "$(fm_list_count "$f" open_questions)" -eq 0 ] || continue
     sed -i.bak 's/^status: *draft/status: ready/' "$f" && rm -f "$f.bak"
     note "autonomy($mode): promoted ${f#"$INSTANCE"/}"
     printf '%s\tpromoted by host\n' "${f#"$INSTANCE"/}" >> "$TICK_DIR/autonomy.tsv"
@@ -1021,9 +1246,12 @@ autonomy_merge() {
     [ -n "$prs" ] || continue
     for pr in $prs; do
       [ -n "$pr" ] || continue
-      state="$("$GH_BIN" pr view "$pr" --json state,mergeable --jq '.state + " " + (.mergeable // "UNKNOWN")' 2>/dev/null || true)"
+      # A draft PR is the shape a role uses to hand over work it could not fully verify —
+      # exactly the thing that must not merge itself.
+      state="$("$GH_BIN" pr view "$pr" --json state,mergeable,isDraft --jq '.state + " " + (.mergeable // "UNKNOWN") + " draft=" + (.isDraft|tostring)' 2>/dev/null || true)"
       case "$state" in
-        "OPEN MERGEABLE") ;;
+        *"draft=true"*) note "autonomy(full): $pr is a draft — not merging"; continue ;;
+        "OPEN MERGEABLE"*) ;;
         *) note "autonomy(full): $pr is '$state' — not merging"; continue ;;
       esac
       # No checks at all is NOT a pass: it is the absence of evidence.
@@ -1053,9 +1281,10 @@ autonomy_merge() {
 # docs as DRAFTS — it cannot promote them, so the gate stays yours. This is the
 # entry point that means you never have to hand-write frontmatter.
 cmd_harness_new() {
-  local inst="" desc="" project="" repo="" dry=0
+  local inst="" desc="" project="" repo="" dry=0 terse=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      --terse)            terse=1; shift ;;
       --instance|--panel) inst="${2:-}"; shift 2 ;;
       --project)          project="${2:-}"; shift 2 ;;
       --repo)             repo="${2:-}"; shift 2 ;;
@@ -1081,6 +1310,11 @@ cmd_harness_new() {
   case "$repo" in ''|null) repo="$default_repo" ;; esac
   case "$repo" in null) repo="" ;; esac
 
+  local jira_note=""
+  if [ "$(cfg jira.enabled false)" = "True" ] || [ "$(cfg jira.enabled false)" = "true" ]; then
+    jira_note="
+- This panel mirrors work into Jira (project $(cfg jira.project '?') on $(cfg jira.site '?')): create one Epic for the project and one Story per task, with the acceptance criteria copied in full, and record the keys in jira_epic:/jira:. Search for an existing issue before creating anything."
+  fi
   local instr
   instr="A human has asked for the following work:
 
@@ -1100,7 +1334,7 @@ Create the documents for it, following SCHEMA.md and the OKF conventions in this
   instr="$instr
 - Write one task document per independently reviewable slice at /projects/<slug>/tasks/<id>.md. Prefer the smallest slice that is independently useful over one big task.
 - Fill acceptance_criteria with testable outcomes. Where a decision genuinely blocks the work and only the human can make it, add a numbered entry to open_questions instead of guessing.
-- Every task must be status: draft. You must NOT set ready — promotion is the human's gate.
+- Every task must be status: draft. You must NOT set ready — promotion is the human's gate.$jira_note
 - Do not dispatch anything and do not write dispatch intents in this run.
 
 Finish with: what you created (paths), what you assumed, and anything you need the human to answer."
@@ -1127,15 +1361,20 @@ Finish with: what you created (paths), what you assumed, and anything you need t
 
   resolve_target "$INSTANCE"
   EXTRA_RUN_ARGS=(-e IS_SANDBOX=1)
-  local claude_args=(claude --permission-mode bypassPermissions --model "$model")
+  local claude_args=(claude --permission-mode bypassPermissions --model "$model"
+                     --output-format stream-json --verbose)
   [ -n "$effort" ] && claude_args+=(--effort "$effort")
-  claude_args+=(--append-system-prompt "$sys" -p "$instr")
+  claude_args+=(--append-system-prompt "$sys" -p "$instr
+
+Write the project's objective document too — \`objectives/<project-slug>.md\`, per SCHEMA.md — and
+point the project document at it with \`objective:\`. A project whose value nobody stated is a
+project nobody can cancel.")
 
   mkdir -p "$INSTANCE_STATE/exits"
   rm -f "$INSTANCE_STATE/exits/$name"
   note "asking the project-manager to draft this ($model${effort:+, effort $effort})…"
   run_box_bg "$name" isolated "$log" "$INSTANCE_STATE/exits/$name" "${claude_args[@]}"
-  wait_for_box "$name" "$INSTANCE_STATE/exits/$name" || true
+  wait_for_box "$name" "$INSTANCE_STATE/exits/$name" "$log" || true
 
   ( cd "$INSTANCE" && find projects -type f -name '*.md' 2>/dev/null | sort ) > "$after"
   echo
@@ -1154,17 +1393,1446 @@ Finish with: what you created (paths), what you assumed, and anything you need t
   if [ -n "$created" ]; then
     echo "created:"
     printf '%s\n' "$created" | sed 's/^/  /'
-    echo
-    echo "review them, then promote what you approve:"
-    printf '%s\n' "$created" | grep '/tasks/' | head -3 | while IFS= read -r t; do
-      echo "  sed -i '' 's/^status: draft/status: ready/' $INSTANCE/$t"
-    done
-    echo
-    echo "then: ./claude-box harness tick $INSTANCE"
+    # `harness do` promotes and drives these itself, so the manual recipe would be noise
+    # and, worse, wrong advice.
+    if [ "$terse" = 0 ]; then
+      echo
+      echo "review them, then promote what you approve:"
+      printf '%s\n' "$created" | grep '/tasks/' | head -3 | while IFS= read -r t; do
+        echo "  sed -i '' 's/^status: draft/status: ready/' $INSTANCE/$t"
+      done
+      echo
+      echo "or let the harness drive them:  claude-box harness do --resume"
+    fi
   else
     echo "no new documents — read the log; it may have amended an existing task or asked you a question"
   fi
   rm -f "$before" "$after"
+}
+
+# --- answering the PM's questions ---------------------------------------------
+# A blocking question is the one thing in the pipeline only a human can clear, so it gets
+# a prompt rather than an instruction to hand-edit YAML. The answer is appended to the
+# question's own line, in the form the project-manager reads on the next pass:
+#
+#   "Q1: which region? --- eu-central-1"
+#
+# Editing a multi-line flow array by hand is exactly the fiddly, easy-to-corrupt work a
+# tool should do, so this rewrites the item in place and leaves the formatting alone.
+answer_write() {
+  local file="$1" index="$2" answer="$3"
+  python3 - "$file" "$index" "$answer" <<'PY_ANSWER'
+import re, sys
+path, index, answer = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+text = open(path, errors="replace").read()
+if not text.startswith("---"):
+    raise SystemExit("not a frontmatter document")
+end = text.index("\n---", 3)
+front, body = text[:end], text[end:]
+
+match = re.search(r"^open_questions:[ \t]*", front, re.M)
+if not match:
+    raise SystemExit("no open_questions")
+rest = front[match.end():]
+if not rest.lstrip().startswith("["):
+    # A BLOCK list: `open_questions:` alone, then indented `- item` lines. Same job as the
+    # flow branch below — rewrite the Nth item in place — but the item boundaries are lines
+    # rather than commas. Refusing this shape meant an answer to a block-form question was
+    # silently dropped, and the task stayed blocked on a question you had already answered.
+    base, spans, pos = match.end(), [], match.end()
+    for line in front[base:].splitlines(True):
+        if line.strip() and not line[:1].isspace():
+            break                       # dedented: the next frontmatter key
+        if line.strip().startswith("- "):
+            lead = len(line) - len(line.lstrip())
+            spans.append((pos + lead + 2, pos + len(line.rstrip("\n"))))
+        pos += len(line)
+    if index < 1 or index > len(spans):
+        raise SystemExit("no question %d" % index)
+    a, b = spans[index - 1]
+    stripped = front[a:b].strip()
+    clean = answer.replace('"', "'").strip()
+    if stripped[:1] in "\"'" and stripped[-1:] == stripped[:1] and len(stripped) > 1:
+        q, inner = stripped[:1], stripped[1:-1].rstrip()
+        replacement = "%s%s --- %s%s" % (q, inner, clean, q)
+    else:
+        replacement = "%s --- %s" % (stripped.rstrip(), clean)
+    open(path, "w").write(front[:a] + replacement + front[b:] + body)
+    raise SystemExit(0)
+
+start = match.end() + rest.index("[")
+depth, i = 0, start
+while i < len(front):
+    if front[i] == "[":
+        depth += 1
+    elif front[i] == "]":
+        depth -= 1
+        if depth == 0:
+            break
+    i += 1
+inner_start, inner_end = start + 1, i
+
+# Split the raw inner text into item spans, ignoring commas inside quotes.
+spans, cur_start, quote = [], inner_start, None
+for j in range(inner_start, inner_end):
+    ch = front[j]
+    if quote:
+        if ch == quote:
+            quote = None
+    elif ch in "\"'":
+        quote = ch
+    elif ch == ",":
+        spans.append((cur_start, j))
+        cur_start = j + 1
+spans.append((cur_start, inner_end))
+spans = [(a, b) for (a, b) in spans if front[a:b].strip()]
+
+if index < 1 or index > len(spans):
+    raise SystemExit("no question %d" % index)
+a, b = spans[index - 1]
+raw = front[a:b]
+stripped = raw.strip()
+# A double quote inside a double-quoted YAML scalar would need escaping; a single quote
+# reads the same to the project-manager and cannot break the document.
+clean = answer.replace('"', "'").strip()
+if stripped[:1] in "\"'" and stripped[-1:] == stripped[:1]:
+    q = stripped[:1]
+    inner = stripped[1:-1].rstrip()
+    replacement = raw.replace(stripped, "%s%s --- %s%s" % (q, inner, clean, q), 1)
+else:
+    replacement = raw.replace(stripped, "%s --- %s" % (stripped.rstrip(), clean), 1)
+
+open(path, "w").write(front[:a] + replacement + front[b:] + body)
+PY_ANSWER
+}
+
+# Where a prompt reads its reply from. NOT stdin: the task list arrives on stdin, and a
+# `read` on stdin would eat the next FILENAME off that list and record it as the answer —
+# which is exactly what happened, silently, to real task documents. So the human is read
+# from the terminal on a dedicated descriptor, opened ONCE so successive reads advance
+# rather than re-reading the first line. Tests point CLAUDE_BOX_TTY at a file.
+answer_open() {
+  local channel="${CLAUDE_BOX_TTY:-/dev/tty}"
+  [ -r "$channel" ] || die "cannot read your answer: $channel is not readable — run this from a terminal"
+  exec 3< "$channel"
+}
+answer_close() { exec 3<&- 2>/dev/null || true; }
+answer_read() {
+  local line
+  IFS= read -r -u 3 line || line=""
+  printf '%s' "$line"
+}
+
+# Walk every unanswered question and ask it. Returns 0 when nothing is left unanswered.
+answer_interactively() {
+  local files="$1" t doc n total q reply answered=0 left=0
+  # The list becomes an array first, so nothing depends on stdin while we are prompting.
+  answer_open
+  local list=() line
+  local old_ifs="$IFS"; IFS=$'\n'
+  for line in $files; do [ -n "$line" ] && list+=("$line"); done
+  IFS="$old_ifs"
+
+  for t in ${list[@]+"${list[@]}"}; do
+    [ -n "$t" ] || continue
+    doc="$INSTANCE/$t"
+    total="$(fm_list_count "$doc" open_questions)"
+    [ "$total" -gt 0 ] || continue
+    echo
+    echo "── $t ──"
+    n=0
+    # Re-read on every iteration: answering shifts nothing, but the file changes on disk.
+    while :; do
+      n=$((n + 1))
+      q="$(fm_list_items "$doc" open_questions | sed -n "${n}p")"
+      [ -n "$q" ] || break
+      case "$q" in *' --- '*) continue ;; esac      # already answered
+      echo
+      printf '%s\n' "$q" | fold -s -w 88 | sed 's/^/  /'
+      printf '\n  your answer (empty to skip) > '
+      reply="$(answer_read)"
+      printf '\n' 
+      if [ -n "$reply" ]; then
+        if answer_write "$doc" "$n" "$reply"; then
+          answered=$((answered + 1))
+          echo "  recorded"
+        else
+          note "could not record that answer — edit $doc by hand"
+          left=$((left + 1))
+        fi
+      else
+        echo "  skipped — this task stays blocked"
+        left=$((left + 1))
+      fi
+    done
+  done
+  answer_close
+  [ "$answered" -gt 0 ] && note "$answered answer(s) recorded"
+  [ "$left" -eq 0 ]
+}
+
+cmd_harness_answer() {
+  local inst="" project="" task=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      --project)          project="${2:-}"; shift 2 ;;
+      --task)             task="${2:-}"; shift 2 ;;
+      -*)                 die "unknown flag for 'harness answer': $1" ;;
+      *)                  inst="$1"; shift ;;
+    esac
+  done
+  resolve_instance "$inst"
+
+  local files
+  if [ -n "$task" ]; then
+    files="${task#/}"
+  else
+    files="$(cd "$INSTANCE" && find "projects${project:+/$project}" -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort)"
+  fi
+
+  local pending=0 t
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ "$(fm_list_count "$INSTANCE/$t" open_questions)" -gt 0 ] && pending=$((pending + 1))
+  done <<< "$files"
+  if [ "$pending" -eq 0 ]; then
+    echo "nothing is waiting on you in $INSTANCE"
+    return 0
+  fi
+  if [ ! -t 0 ]; then
+    die "'harness answer' needs a terminal — it asks questions. Run it from your shell."
+  fi
+
+  echo "$pending task(s) have questions only you can answer."
+  echo "Answers are appended to the question in the task document; the next run folds them in."
+  if answer_interactively "$files"; then
+    echo
+    echo "everything answered — continue with:  claude-box harness do --resume"
+  else
+    echo
+    echo "some questions are still open; those tasks stay blocked until they are answered."
+  fi
+}
+
+# An answered question is not a cleared question: the answer sits in the entry until the
+# project-manager folds it into the task and deletes it. The host deliberately refuses to
+# promote a task while any entry remains — an answer may change the work, or cancel it —
+# so a resume that skipped the PM would stall forever on answered tasks.
+answers_pending() {
+  local files="$1" t
+  local old_ifs="$IFS"; IFS=$'\n'
+  for t in $files; do
+    [ -n "$t" ] || continue
+    if fm_list_items "$INSTANCE/$t" open_questions | grep -q ' --- '; then
+      IFS="$old_ifs"; return 0
+    fi
+  done
+  IFS="$old_ifs"; return 1
+}
+
+fold_answers() {
+  local files="$1" list model sys effort name log
+  list="$(printf '%s\n' "$files" | sed 's|^|- /|')"
+  model="$(role_model project-manager)"
+  effort="$(role_effort project-manager "$model")"
+  sys="$(role_system_prompt project-manager)"
+  name="$(unique_name "claude-box-h-$INSTANCE_SLUG-pm-fold")"
+  log="$STATE_HOME/logs/$name.log"
+  mkdir -p "$INSTANCE_STATE/exits"
+  rm -f "$INSTANCE_STATE/exits/$name"
+
+  local claude_args=(claude --permission-mode bypassPermissions --model "$model"
+                     --output-format stream-json --verbose)
+  [ -n "$effort" ] && claude_args+=(--effort "$effort")
+  claude_args+=(--append-system-prompt "$sys" -p "The human has answered open questions on these tasks:
+
+$list
+
+For every entry in an open_questions list that contains ' --- ', the text after the delimiter is the human's answer. For each one:
+  1. Fold the answer into the task where it belongs — # Context, acceptance_criteria, or # Notes — so the task is complete without the question.
+  2. DELETE that entry from open_questions. No answered-question history is kept.
+  3. If the answer says to skip, drop, defer or hand the work to someone else, set that task's status to cancelled and record why in # Notes. Do not implement work the human declined.
+  4. If the answer raises a NEW question rather than settling it, leave a fresh numbered entry saying exactly what you still need. Do not invent an answer.
+Adjust acceptance_criteria where the answer changes them. Do NOT set any task to ready — promotion is not yours. Then report, per task, what you folded in and what you changed.")
+
+  resolve_target "$INSTANCE"
+  EXTRA_RUN_ARGS=(-e IS_SANDBOX=1)
+  note "folding your answers in ($model${effort:+, $effort})…"
+  run_box_bg "$name" isolated "$log" "$INSTANCE_STATE/exits/$name" "${claude_args[@]}"
+  wait_for_box "$name" "$INSTANCE_STATE/exits/$name" "$log" || true
+  local why; why="$(box_failure_reason "$log" "$(cat "$INSTANCE_STATE/exits/$name" 2>/dev/null || true)")"
+  if [ -n "$why" ]; then
+    note "the fold-in box did not do the work: $why"
+    tail -4 "$log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  note "folded in — log: $log"
+  return 0
+}
+
+# --- register the stack on GitHub ----------------------------------------------
+# Opening a PR with `--base <dependency branch>` gives a correct stacked DIFF, which is the
+# part that matters for review. It does not tell GitHub the PRs form a chain — `gh stack view`
+# and the stack UI stay empty until someone links them. The host does that, because it is the
+# only party that knows the whole chain: each agent only ever sees its own task.
+task_chain() {
+  # Ordered bottom-to-top: dependencies first, then the task itself. Depth-first, deduped.
+  local task="${1#/}" seen="$2" dep
+  case " $seen " in (*" $task "*) return 0 ;; esac
+  seen="$seen $task"
+  local deps; deps="$(fm_list_items "$INSTANCE/$task" depends_on 2>/dev/null)"
+  local old_ifs="$IFS"; IFS=$'\n'
+  for dep in $deps; do
+    dep="${dep#/}"
+    [ -f "$INSTANCE/$dep" ] || continue
+    IFS="$old_ifs"
+    task_chain "$dep" "$seen"
+    IFS=$'\n'
+  done
+  IFS="$old_ifs"
+  printf '%s\n' "$task"
+}
+
+link_stack() {
+  local task="$1" repo="$2"
+  local repo_dir="$ROOT/${repo##*/}"
+  [ -d "$repo_dir/.git" ] || return 0
+  command -v "$GH_BIN" >/dev/null 2>&1 || return 0
+
+  local chain urls="" t pr
+  chain="$(task_chain "$task" "" | awk '!seen[$0]++')"
+  local old_ifs="$IFS"; IFS=$'\n'
+  for t in $chain; do
+    pr="$(fm_list_items "$INSTANCE/$t" pr | head -1)"
+    [ -n "$pr" ] && urls="$urls $pr"
+  done
+  IFS="$old_ifs"
+
+  # One PR is not a stack.
+  local count; count="$(printf '%s\n' $urls | grep -c . || true)"
+  [ "${count:-0}" -ge 2 ] || return 0
+
+  note "  linking $count PRs into a stack on GitHub"
+  if ( cd "$repo_dir" && "$GH_BIN" stack link $urls >/dev/null 2>&1 ); then
+    note "    stacked: $(printf '%s ' $urls | sed 's|https://[^ ]*/pull/|#|g')"
+  else
+    note "    gh stack link failed — the PR bases are still correct, only the stack view is missing"
+  fi
+}
+
+# --- the human closes work out --------------------------------------------------
+# `done` is terminal: harness.sh's own reset keeps it, so no command here can undo one. It is
+# also the one status whose evidence lives outside the panel — a merge button on GitHub, often
+# pressed by someone who is not running this harness. So the human says it, from whatever state
+# the document is in, and the host's job is to RECORD what was true at that moment rather than
+# to argue: every PR is looked up and the answer goes into `# Notes` verbatim, merged or not.
+# A done that carries "PR #12 was OPEN when this was marked" cannot mislead anyone later.
+task_append_note() {
+  local doc="$1" line="$2"
+  python3 - "$doc" "$line" <<'PY_NOTE'
+import sys
+path, line = sys.argv[1], sys.argv[2]
+text = open(path, errors="replace").read().rstrip("\n")
+if "\n# Notes" in text or text.startswith("# Notes"):
+    text += "\n\n" + line
+else:
+    text += "\n\n# Notes\n\n" + line
+open(path, "w").write(text + "\n")
+PY_NOTE
+}
+
+cmd_harness_done() {
+  local inst="" target="" nopr=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      --no-pr)            nopr=1; shift ;;
+      -*)                 die "unknown flag for 'harness done': $1" ;;
+      *)                  if [ -z "$target" ]; then target="$1"; else inst="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die "'harness done' needs a task path, a project path, or a project slug"
+  resolve_instance "$inst"
+
+  # A bare project slug is what the dashboard's project table has to offer, so accept it.
+  case "$target" in
+    (*/*|*.md) ;;
+    (*) [ -f "$INSTANCE/projects/$target/project.md" ] && target="projects/$target/project.md" ;;
+  esac
+
+  # Every refusal below RETURNS. This is reachable from the dashboard, where a die would take
+  # the request down with nothing to show the human what stopped it.
+  local doc
+  doc="$(python3 - "$INSTANCE" "$target" <<'PY_RESOLVE'
+import os, sys
+inst = os.path.realpath(sys.argv[1])
+doc = os.path.realpath(os.path.join(inst, sys.argv[2].lstrip("/")))
+print(doc if doc.startswith(inst + os.sep) and os.path.isfile(doc) else "")
+PY_RESOLVE
+)"
+  [ -n "$doc" ] || { note "not a document in this panel: $target"; return 1; }
+
+  local kind
+  if grep -q '^type: *Task' "$doc"; then kind=task
+  elif grep -q '^type: *Project' "$doc"; then kind=project
+  else note "not a Task or Project document: $target"; return 1
+  fi
+
+  local st; st="$(task_status "$doc")"
+  [ "$st" = done ] && { echo "  ${target} is already done"; return 0; }
+
+  # No status gate. Whatever state the document is in, the human is allowed to close it out —
+  # what state it was in goes on the record instead of into a refusal.
+  local evidence="was $st"
+  if [ "$kind" = project ]; then
+    local open_tasks
+    open_tasks="$(find "$INSTANCE/$(dirname "${doc#"$INSTANCE"/}")/tasks" -type f -name '*.md' 2>/dev/null \
+                  | while IFS= read -r f; do
+                      case "$(task_status "$f")" in (done|cancelled) ;; (*) printf '%s ' "$(basename "$f")" ;; esac
+                    done)"
+    if [ -n "$open_tasks" ]; then
+      evidence="$evidence; tasks not terminal at the time: ${open_tasks% }"
+      note "note: these tasks are not done or cancelled — ${open_tasks% }"
+    else
+      evidence="$evidence; every task done or cancelled"
+    fi
+  elif [ "$nopr" = 1 ]; then
+    evidence="$evidence; merges not checked (--no-pr)"
+  else
+    local prs; prs="$(fm_list_items "$doc" pr)"
+    if [ -z "$prs" ]; then
+      evidence="$evidence; no PR on this task"
+    elif ! command -v "$GH_BIN" >/dev/null 2>&1; then
+      evidence="$evidence; gh not on PATH, so the merges were never checked"
+      note "gh is not on PATH — recording the merges as unchecked"
+    else
+      local p state merged=0 unmerged=""
+      while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        state="$("$GH_BIN" pr view "$p" --json state --jq .state 2>/dev/null | tr -d '[:space:]')"
+        printf '  %-60s %s\n' "$p" "${state:-unknown}"
+        case "$state" in
+          (MERGED) merged=$((merged + 1)) ;;
+          (*)      unmerged="$unmerged$p ${state:-unknown}, " ;;
+        esac
+      done <<< "$prs"
+      if [ -n "$unmerged" ]; then
+        evidence="$evidence; NOT every PR was merged — ${unmerged%, }"
+        note "recording that these PRs were not merged: ${unmerged%, }"
+      else
+        evidence="$evidence; $merged PR(s) merged, checked against gh"
+      fi
+    fi
+  fi
+
+  set_task_field "$doc" status done
+  task_append_note "$doc" "A human marked this done on $(date +%Y-%m-%dT%H:%M:%SZ) — $evidence."
+  echo "  ${target} is done ($evidence)"
+  return 0
+}
+
+cmd_harness_stack() {
+  local inst="" project="" task=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      --project)          project="${2:-}"; shift 2 ;;
+      --task)             task="${2#/}"; shift 2 ;;
+      -*)                 die "unknown flag for 'harness stack': $1" ;;
+      *)                  inst="$1"; shift ;;
+    esac
+  done
+  resolve_instance "$inst"
+
+  local files t repo
+  if [ -n "$task" ]; then
+    files="$task"
+  else
+    files="$(cd "$INSTANCE" && find "projects${project:+/$project}" -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort)"
+  fi
+  # Link from the deepest task that has a PR: linking the tip covers everything below it.
+  local best="" best_depth=0 depth
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ "$(fm_list_count "$INSTANCE/$t" pr)" -gt 0 ] || continue
+    depth="$(task_chain "$t" "" | awk '!seen[$0]++' | grep -c . || true)"
+    if [ "${depth:-0}" -gt "$best_depth" ]; then best="$t"; best_depth="$depth"; fi
+  done <<< "$files"
+
+  [ -n "$best" ] || { echo "no task in scope has a pull request yet"; return 0; }
+  repo="$(task_field "$INSTANCE/$best" target_repo)"
+  echo "linking the stack that ends at $best"
+  link_stack "$best" "$repo"
+}
+
+# --- a finished draft becomes ready for review ----------------------------------
+# The draft flag means "not finished yet". Once qa has approved, the architect has not objected
+# and CI is not failing, the change IS finished as far as any agent can take it — leaving it a
+# draft hides completed work behind a flag nobody clears. Roles must not do this (they would
+# mark their own work ready), so the host does it, and only when every condition is checkable.
+pr_ready_if_finished() {
+  local task="$1" repo="$2" doc="$INSTANCE/${task#/}"
+  command -v "$GH_BIN" >/dev/null 2>&1 || return 0
+  # Terminal states are decisions: a cancelled task with an approved draft PR must not be
+  # revived into in-progress or in-review by a gate that only exists for live work.
+  case "$(task_status "$doc")" in (done|cancelled) return 0 ;; esac
+
+  local qa arch pr state draft checks
+  qa="$(task_field "$doc" qa)"
+  arch="$(task_field "$doc" arch)"
+  [ "$qa" = approved ] || return 0
+  [ "$arch" = changes-requested ] && return 0
+  # Approved work that does not merge is not finished work. Marking it ready for review sends a
+  # human to a PR GitHub will refuse — and it was silent about it.
+  task_merge_state "$doc" "${task#/}" "$repo"
+  if [ "$PR_MERGE_STATE" = CONFLICTING ]; then
+    set_task_field "$doc" status in-progress
+    note "    $(basename "$doc"): approved but CONFLICTING against ${PR_MERGE_BASE:-its base} — left as work, not review"
+    return 0
+  fi
+
+  pr="$(fm_list_items "$doc" pr | head -1)"
+  [ -n "$pr" ] || return 0
+
+  state="$("$GH_BIN" pr view "$pr" --json state,isDraft --jq '.state + " draft=" + (.isDraft|tostring)' 2>/dev/null || true)"
+  case "$state" in
+    (*"draft=true"*) ;;
+    (*) return 0 ;;                      # already ready for review, or not open
+  esac
+  case "$state" in (OPEN*) ;; (*) return 0 ;; esac
+
+  # A failing check means it is not finished, whatever the review said.
+  checks="$("$GH_BIN" pr checks "$pr" --json state --jq '[.[].state] | join(",")' 2>/dev/null || true)"
+  case "$checks" in
+    (*FAILURE*|*ERROR*|*CANCELLED*|*TIMED_OUT*|*ACTION_REQUIRED*)
+      note "    $pr stays a draft — CI is failing"; return 0 ;;
+  esac
+
+  if "$GH_BIN" pr ready "$pr" >/dev/null 2>&1; then
+    note "    marked $pr ready for review (qa approved, CI not failing)"
+    case "$(task_status "$doc")" in
+      (in-review) ;;
+      (*) set_task_field "$doc" status in-review ;;
+    esac
+  else
+    note "    could not mark $pr ready for review"
+  fi
+}
+
+# --- status transitions the host can observe ------------------------------------
+# Asking the role to set `status: in-progress` when it starts made the board a matter of
+# whether an agent remembered a bookkeeping step — and it frequently did not, so a task
+# being worked on still read `ready`, and a finished one still read `in-progress`. The host
+# knows when it launched a box and what the document says afterwards, so the host writes the
+# transitions it can VERIFY. The role keeps the ones that need judgement: blocked, and the
+# qa/arch verdicts.
+set_task_field() {
+  local doc="$1" key="$2" value="$3"
+  python3 - "$doc" "$key" "$value" <<'PY_SET'
+import re, sys
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path, errors="replace").read()
+end = text.index("\n---", 3) if text.startswith("---") else -1
+if end < 0:
+    raise SystemExit(0)
+front, body = text[:end], text[end:]
+if re.search(r"^%s:" % re.escape(key), front, re.M):
+    front = re.sub(r"^%s:.*$" % re.escape(key), "%s: %s" % (key, value), front, count=1, flags=re.M)
+else:
+    front = front.rstrip("\n") + "\n%s: %s" % (key, value)
+open(path, "w").write(front + body)
+PY_SET
+}
+
+# Called when a box is launched for a task.
+task_mark_working() {
+  local doc="$1" role="$2" box="$3"
+  # Any role starting on untouched work moves it off the shelf.
+  case "$(task_status "$doc")" in
+    (ready|draft) set_task_field "$doc" status in-progress ;;
+  esac
+  # An implementer dispatched at a BLOCKED task — the whole point of resuming one — means
+  # that task is being built right now. Leaving it blocked made the board claim nothing was
+  # happening while lead-dev worked, and left last attempt's reason on the card. A reviewer
+  # is the exception: it reads an in-review task, so it must not claim to be building it.
+  case "$role" in
+    (qa-reviewer|architect|cataloguer|project-manager) ;;
+    (*)
+      case "$(task_status "$doc")" in
+        (blocked|in-review)
+          set_task_field "$doc" status in-progress
+          [ -n "$(task_field "$doc" blocked_reason)" ] && set_task_field "$doc" blocked_reason ""
+          ;;
+      esac ;;
+  esac
+  # NOT assignee: that is the project-manager's routing decision, and overwriting it with
+  # whichever role happens to be running rewrote the routing — after a design review the
+  # pipeline then dispatched `architect` again instead of the implementer. `box` records who
+  # is working right now; `assignee` records who the work belongs to.
+  set_task_field "$doc" box "$box"
+  set_task_field "$doc" started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# Called after the box exits: reconcile what the document claims against what exists.
+task_reconcile() {
+  local doc="$1" code="$2" prs status
+  prs="$(fm_list_count "$doc" pr)"
+  status="$(task_status "$doc")"
+  set_task_field "$doc" box ""
+  # A PR exists and nobody said otherwise: it is in review, draft or not.
+  if [ "$prs" -gt 0 ] && [ "$status" = in-progress ]; then
+    set_task_field "$doc" status in-review
+    return 0
+  fi
+  # No PR and the box is gone: it is not "in progress" any more, whatever it says.
+  if [ "$prs" -eq 0 ] && [ "$status" = in-progress ]; then
+    local tries; tries="$(task_field "$doc" attempts)"; tries="${tries:-0}"
+    case "$tries" in (''|*[!0-9]*) tries=0 ;; esac
+    case "$code" in
+      (0) set_task_field "$doc" status ready
+          note "    no PR was opened — task returned to ready" ;;
+      # A clock is not a verdict. A timeout, a stop (143) or a kill (137) says nothing about
+      # whether the work is possible — the worktree still holds everything the box did — so
+      # the task stays in-progress and the next --resume carries on where it left off.
+      # Only after ATTEMPT_CAP such endings does it become a block worth a human's attention.
+      (timeout|stalled|143|137)
+          tries=$((tries + 1))
+          set_task_field "$doc" attempts "$tries"
+          if [ "$tries" -ge "$CLAUDE_BOX_TASK_ATTEMPTS" ]; then
+            set_task_field "$doc" status blocked
+            set_task_field "$doc" blocked_reason "ran out of time $tries times (last: $code) without opening a pull request"
+            note "    $tries timeouts with no PR — task marked blocked"
+          else
+            set_task_field "$doc" blocked_reason "attempt $tries ended ($code) before a PR — resumable"
+            note "    box ran out of time with no PR — left in-progress, resume continues it"
+          fi ;;
+      (*) set_task_field "$doc" status blocked
+          set_task_field "$doc" blocked_reason "the box ended ($code) without opening a pull request"
+          note "    box ended $code with no PR — task marked blocked" ;;
+    esac
+  fi
+}
+
+# A block the host wrote because a box stopped early is not a judgement about the work, so
+# --resume picks it up again; a block a role reasoned its way to ("needs production creds")
+# waits for --retry, i.e. for something about the world to change.
+blocked_retryable() {
+  case "$(task_field "$1" blocked_reason)" in
+    # No reason at all is not a judgement — it is a document nobody finished writing. Neither
+    # is the note board_normalise leaves on such a document: stamping it must not change how
+    # the task is routed, and for one run it did — t4 was skipped by the same resume that had
+    # just stamped it, because the stamp did not match this list.
+    (""|"the box ended "*|"ran out of time "*|"attempt "*|"blocked without a stated reason"*) return 0 ;;
+    (*) return 1 ;;
+  esac
+}
+
+# `box:` names the container working a task right now. Stop the run and that name outlives
+# the container, so the board keeps showing "working" for a box that no longer exists — and
+# the in-flight markers keep counting against the cap. Both are host bookkeeping, so the host
+# clears them the moment it can see the container is gone.
+clear_dead_box_markers() {
+  local t doc name
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    doc="$INSTANCE/$t"
+    name="$(task_field "$doc" box)"
+    [ -n "$name" ] || continue
+    box_is_running "$name" && continue
+    set_task_field "$doc" box ""
+    note "  ${t}: cleared box $name — that container is gone"
+  done <<< "$(cd "$INSTANCE" && find projects -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort)"
+  local m
+  for m in "$INSTANCE_STATE/inflight"/*; do
+    [ -e "$m" ] || continue
+    name="$(cat "$m" 2>/dev/null || true)"
+    [ -n "$name" ] && box_is_running "$name" && continue
+    rm -f "$m"
+  done
+  return 0
+}
+
+# Documents that contradict themselves stall a board silently: "blocked" with no reason and
+# an open pull request is not a block, it is a review nobody moved. Run before gathering
+# work, so one pass of the truth the host can see beats a human editing frontmatter.
+# Read-only about worktrees and branches — this only rewrites status fields.
+board_normalise() {
+  local scope="$1" t doc prs
+  clear_dead_box_markers
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    doc="$INSTANCE/$t"
+    # A verdict that parks work on a human is not one any more: CI is the source of truth.
+    case "$(task_field "$doc" qa)" in
+      (''|approved|changes-requested) ;;
+      (*) set_task_field "$doc" qa changes-requested
+          note "  $t: qa verdict handed verification to a human — recorded as changes-requested" ;;
+    esac
+    [ "$(task_status "$doc")" = blocked ] || continue
+    [ -z "$(task_field "$doc" blocked_reason)" ] || continue
+    prs="$(fm_list_count "$doc" pr)"
+    if [ "$prs" -gt 0 ]; then
+      set_task_field "$doc" status in-review
+      note "  $t: blocked with no reason but PR open — moved to in-review"
+    else
+      # Phrased to match blocked_retryable: a note the host wrote is never a verdict.
+      set_task_field "$doc" blocked_reason "the box ended without a stated reason"
+      note "  $t: blocked with no reason — recorded as unexplained, resume will retry it"
+    fi
+  done <<< "$(cd "$INSTANCE" && find "$scope" -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort)"
+  return 0
+}
+
+# Does this task's pull request still merge into its base? Neither role noticed that t8 was
+# CONFLICTING, and the reason is worth writing down: the worktree was CLEAN. A stacked child
+# conflicts against a base that moved, which exists only on GitHub — `git status` in the box
+# shows nothing. GitHub also computes `mergeable` LAZILY: it answers UNKNOWN for a few seconds
+# after any push, so one look is not an answer. Ask, retry the unknown, and tell the box.
+#
+# Sets PR_MERGE_STATE to CONFLICTING | MERGEABLE | UNKNOWN | "" (no PR, or no gh).
+# A base branch that keeps moving makes every child of it CONFLICTING, and paying an agent a
+# round to run `git rebase` is paying for typing. So the host does the mechanical case itself:
+# fetch, rebase, force-with-lease. It does NOT do the judgement case — a rebase that hits a real
+# conflict is aborted and handed to the box, which is told about it in its prompt.
+#
+# Three refusals, each one a way this could destroy work:
+#   * uncommitted changes in the worktree — rebasing over them loses them
+#   * no worktree on the host — nothing to rebase in
+#   * --force-with-lease, always — never overwrite a push this host has not seen
+CLAUDE_BOX_AUTOREBASE="${CLAUDE_BOX_AUTOREBASE:-1}"
+
+task_autorebase() {
+  local task="$1" repo="$2" base="$3"
+  [ "$CLAUDE_BOX_AUTOREBASE" = 1 ] || return 1
+  [ -n "$repo" ] && [ -n "$base" ] || return 1
+  local repo_dir="$ROOT/${repo##*/}" name wt gd
+  name="$(worktree_name "$task")"
+  wt="$ROOT/_wt/$name"
+  gd="$repo_dir/.git/worktrees/$name"
+  [ -d "$wt" ] && [ -d "$gd" ] || return 1
+
+  local g=(git --git-dir "$gd" --work-tree "$wt")
+  if [ -n "$("${g[@]}" status --porcelain 2>/dev/null)" ]; then
+    note "    not rebasing $name automatically — the worktree has uncommitted changes"
+    return 1
+  fi
+  ( cd "$repo_dir" && git fetch --quiet origin "$base" 2>/dev/null ) || true
+  if "${g[@]}" rebase --quiet "origin/${base#origin/}" >/dev/null 2>&1; then
+    local branch; branch="$("${g[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    if ( cd "$wt" && "${g[@]}" push --quiet --force-with-lease origin "HEAD:refs/heads/$branch" >/dev/null 2>&1 ); then
+      note "    rebased $name onto origin/${base#origin/} and pushed — the conflict was the base moving"
+      return 0
+    fi
+    note "    rebased $name locally but the push was refused (someone else pushed) — leaving it to the box"
+    return 1
+  fi
+  "${g[@]}" rebase --abort >/dev/null 2>&1 || true
+  note "    $name does not rebase cleanly onto origin/${base#origin/} — a real conflict, for the box to resolve"
+  return 1
+}
+
+# Conflicts a pairwise check cannot see. A stack is merged as a whole, so a task can merge
+# cleanly into its own base and still be unmergeable: t8 added
+# `.github/workflows/…-playwright-e2e.yml`, t1 further down the stack had already added a
+# different version of that exact path, and add/add on one path is a conflict. t8 vs t3 was
+# clean the whole time — the wrong question. Ask git to merge against every ancestor branch.
+#
+# Sets STACK_CONFLICTS to "<branch>: <path> <path>" lines, empty when the stack merges.
+STACK_CONFLICTS=""
+task_stack_conflicts() {
+  local task="${1#/}" repo="$2"
+  STACK_CONFLICTS=""
+  [ -n "$repo" ] || return 0
+  local repo_dir="$ROOT/${repo##*/}" gd="$ROOT/${repo##*/}/.git/worktrees/$(worktree_name "$task")"
+  [ -d "$gd" ] || return 0
+  local mine; mine="$(branch_for_task "$task")"
+  local chain t br out
+  chain="$(task_chain "$task" "" | awk '!seen[$0]++')"
+  local old_ifs="$IFS"; IFS=$'\n'
+  for t in $chain; do
+    [ "${t#/}" = "$task" ] && continue
+    br="$(branch_for_task "${t#/}")"
+    IFS="$old_ifs"
+    ( cd "$repo_dir" && git fetch --quiet origin "$br" 2>/dev/null ) || true
+    git --git-dir "$gd" rev-parse --verify --quiet "origin/$br" >/dev/null 2>&1 || { IFS=$'\n'; continue; }
+    # merge-tree exits non-zero on conflict and names the conflicted paths.
+    if ! out="$(git --git-dir "$gd" merge-tree --write-tree --name-only \
+                  "origin/$mine" "origin/$br" 2>/dev/null)"; then
+      # Drop the tree oid on the first line; the rest are the conflicting paths.
+      local paths; paths="$(printf '%s\n' "$out" | awk 'NR>1 { if ($0 == "") exit; print }' | tr '\n' ' ')"
+      [ -n "$paths" ] && STACK_CONFLICTS="$STACK_CONFLICTS$br: $paths
+"
+    fi
+    IFS=$'\n'
+  done
+  IFS="$old_ifs"
+  [ -n "$STACK_CONFLICTS" ] && return 1
+  return 0
+}
+
+PR_MERGE_STATE="" PR_MERGE_BASE=""
+task_merge_state() {
+  local doc="$1" task="${2:-}" repo="${3:-}" pr tries=0
+  PR_MERGE_STATE="" PR_MERGE_BASE=""
+  command -v "$GH_BIN" >/dev/null 2>&1 || return 0
+  pr="$(fm_list_items "$doc" pr | head -1)"
+  [ -n "$pr" ] || return 0
+
+  # Ask git first when we can. GitHub's `mergeable` is recomputed lazily and lagged minutes
+  # behind a force-push that had already made the branch merge cleanly — it still said
+  # CONFLICTING for a branch whose base was, provably, an ancestor of its head. A base that is
+  # an ancestor of the head is the definition of "nothing to conflict with", and it costs a
+  # local rev-parse instead of a network round trip.
+  if [ -n "$task" ] && [ -n "$repo" ]; then
+    local gd="$ROOT/${repo##*/}/.git/worktrees/$(worktree_name "$task")"
+    local base; base="$("$GH_BIN" pr view "$pr" --json baseRefName -q .baseRefName 2>/dev/null)"
+    if [ -d "$gd" ] && [ -n "$base" ]; then
+      PR_MERGE_BASE="$base"
+      ( cd "$ROOT/${repo##*/}" && git fetch --quiet origin "$base" 2>/dev/null ) || true
+      if git --git-dir "$gd" merge-base --is-ancestor "origin/$base" HEAD 2>/dev/null; then
+        PR_MERGE_STATE=MERGEABLE
+        return 0
+      fi
+    fi
+  fi
+  while [ "$tries" -lt 3 ]; do
+    local out; out="$("$GH_BIN" pr view "$pr" --json mergeable,baseRefName \
+                        -q '.mergeable + " " + .baseRefName' 2>/dev/null || true)"
+    PR_MERGE_STATE="${out%% *}"; PR_MERGE_BASE="${out#* }"
+    case "$PR_MERGE_STATE" in
+      (CONFLICTING|MERGEABLE) return 0 ;;
+      (*) tries=$((tries + 1)); sleep 3 ;;
+    esac
+  done
+  return 0
+}
+
+# --- the host creates the worktree ---------------------------------------------
+# Letting the role create its own worktree cost a whole run: it put it at
+# <repo>/_wt/<name> — INSIDE the monorepo — so six thousand files showed up as untracked on
+# main. The path, the base branch and the branch name are all facts the host already knows,
+# so the host issues the command. The agent is told where to work, and told not to create
+# one.
+#
+# It still runs INSIDE a box: git stores absolute paths in worktree metadata, so a
+# host-created worktree would be unusable by the box that has to work in it.
+TASK_WORKTREE="" TASK_BRANCH="" TASK_BASE=""
+
+branch_for_task() {
+  local task="$1" doc="$INSTANCE/$1" title slug project stem
+  project="$(printf '%s' "${task#/}" | awk -F/ '{ if ($1 == "projects") print $2 }')"
+  stem="$(basename "${task%.md}")"
+  title="$(task_field "$doc" title)"
+  # Name the branch after the change, not the role: a reviewer cares what it does.
+  # Short enough to read in a PR list: a few words of the title, not the whole sentence.
+  slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]' \
+            | tr -c 'a-z0-9' '-' | sed 's/--*/-/g; s/^-//' \
+            | cut -c1-28 | sed 's/-[a-z0-9]*$//; s/-$//')"
+  printf '%s/%s%s\n' "$(slug "$project")" "$stem" "${slug:+-$slug}"
+}
+
+# The branch a task should be built on top of.
+#
+# `depends_on` is the plan saying "this cannot exist without that". Basing every task on
+# origin/<default> anyway produces sibling branches that each re-contain their dependency's
+# work, and pull requests that all target main — which is not a stack, just a pile. So: if a
+# dependency's branch exists and is not merged yet, build on it and open the PR against it.
+task_base_branch() {
+  local task="$1" repo_dir="$2" default="$3" dep dep_branch best=""
+  local deps; deps="$(fm_list_items "$INSTANCE/${task#/}" depends_on)"
+  [ -n "$deps" ] || { printf '%s\n' "origin/$default"; return 0; }
+
+  local old_ifs="$IFS"; IFS=$'\n'
+  for dep in $deps; do
+    dep="${dep#/}"
+    [ -f "$INSTANCE/$dep" ] || continue
+    dep_branch="$(branch_for_task "$dep")"
+    git -C "$repo_dir" rev-parse --verify --quiet "$dep_branch" >/dev/null 2>&1 || continue
+    # A merged dependency is already in the default branch; stacking on it would be noise.
+    git -C "$repo_dir" merge-base --is-ancestor "$dep_branch" "origin/$default" 2>/dev/null && continue
+    if [ -z "$best" ]; then
+      best="$dep_branch"
+    elif git -C "$repo_dir" merge-base --is-ancestor "$best" "$dep_branch" 2>/dev/null; then
+      # dep_branch already contains best, so it is further up the chain.
+      best="$dep_branch"
+    fi
+  done
+  IFS="$old_ifs"
+  printf '%s\n' "${best:-origin/$default}"
+}
+
+# Sets TASK_WORKTREE (container path), TASK_BRANCH and TASK_BASE, creating the worktree if needed.
+ensure_task_worktree() {
+  local task="$1" repo="$2" doc="$INSTANCE/$1"
+  TASK_WORKTREE="" TASK_BRANCH="" TASK_BASE=""
+  [ -n "$repo" ] || return 0
+  local repo_dir="$ROOT/${repo##*/}"
+  [ -d "$repo_dir/.git" ] || [ -f "$repo_dir/.git" ] || {
+    note "no clone at $repo_dir — the role will have to sort the repo out itself"; return 0; }
+
+  local name branch host_path ct_path repo_ct base
+  name="$(worktree_name "$task")"
+  branch="$(branch_for_task "$task")"
+  host_path="$ROOT/_wt/$name"
+  ct_path="$CONTAINER_WS/_wt/$name"
+  repo_ct="$CONTAINER_WS/${repo##*/}"
+  TASK_WORKTREE="$ct_path"; TASK_BRANCH="$branch"
+
+  # Check for a stray worktree inside the repo FIRST — it is the failure that matters most,
+  # and it must be cleaned whether or not the correct worktree already exists.
+  if [ -d "$repo_dir/_wt" ]; then
+    note "  removing a stray _wt inside $repo — a worktree must never live inside the repo"
+    git -C "$repo_dir" worktree prune 2>/dev/null || true
+    # This is the human's repo, so no rm -rf: registered worktrees go through git, which
+    # refuses a dirty one, and only empty directories are removed after that.
+    local stray
+    for stray in "$repo_dir/_wt"/*; do
+      [ -e "$stray" ] || continue
+      if [ -f "$stray/.git" ]; then git -C "$repo_dir" worktree remove "$stray" >/dev/null 2>&1 || true; fi
+      rmdir "$stray" 2>/dev/null || true
+    done
+    rmdir "$repo_dir/_wt" 2>/dev/null \
+      || note "  $repo/_wt still has content (uncommitted work, or files git never registered) — left alone; clean it by hand"
+  fi
+
+  if [ -d "$host_path" ]; then
+    TASK_BASE="$(task_base_branch "$task" "$repo_dir" \
+      "$(b="$(git -C "$repo_dir" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null)"; printf '%s' "${b##*/}")")"
+    note "  worktree exists: _wt/$name on $branch (base ${TASK_BASE:-origin/HEAD})"
+    return 0
+  fi
+
+  # Base on the remote's default branch, never on whatever the local clone is parked on.
+  base="$(git -C "$repo_dir" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+  base="${base##*/}"
+  [ -n "$base" ] || base="$(git -C "$repo_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+
+  # Stack on an unmerged dependency when the plan says this task needs one.
+  local start; start="$(task_base_branch "$task" "$repo_dir" "$base")"
+  TASK_BASE="$start"
+  case "$start" in
+    ("origin/$base") note "  creating worktree _wt/$name from origin/$base on branch $branch" ;;
+    (*)              note "  creating worktree _wt/$name STACKED on $start (branch $branch)" ;;
+  esac
+  WORKDIR="$repo_ct"
+  local wt_log="$STATE_HOME/harness/$INSTANCE_SLUG/worktree-$name.log"
+  mkdir -p "$(dirname "$wt_log")"
+  # An existing local branch is a previous attempt whose unpushed commits are what resume
+  # continues from — check it out rather than deleting and recreating it from the base.
+  if ! box_exec "set -e
+    git -C '$repo_ct' fetch --quiet origin '$base' || git -C '$repo_ct' fetch --quiet origin || true
+    mkdir -p '$CONTAINER_WS/_wt'
+    git -C '$repo_ct' worktree prune || true
+    if git -C '$repo_ct' show-ref --verify --quiet 'refs/heads/$branch'; then
+      git -C '$repo_ct' worktree add '$ct_path' '$branch'
+    else
+      git -C '$repo_ct' worktree add -b '$branch' '$ct_path' '$start'
+    fi" \
+    > "$wt_log" 2>&1; then
+    note "  worktree creation failed — see $wt_log"
+    tail -3 "$wt_log" | sed 's/^/    /'
+  fi
+
+  if [ ! -d "$host_path" ]; then
+    note "  worktree was not created at $host_path"
+    TASK_WORKTREE=""; TASK_BRANCH=""
+    return 1
+  fi
+  return 0
+}
+
+# --- stop everything -----------------------------------------------------------
+# `claude-box stop --all` stops BOXES, and the driver then cheerfully dispatches the next
+# task — so stopping a run took two commands and knowing that. One command now.
+cmd_harness_stop() {
+  local inst="" keep_lock=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      --keep-lock)        keep_lock=1; shift ;;
+      -*)                 die "unknown flag for 'harness stop': $1" ;;
+      *)                  inst="$1"; shift ;;
+    esac
+  done
+  resolve_instance "$inst"
+
+  # 1. The drivers first. Killing boxes while a driver lives just starts the next task.
+  local drivers
+  drivers="$(pgrep -f 'claude-box harness (do|loop|tick)' 2>/dev/null || true)"
+  if [ -n "$drivers" ]; then
+    printf '%s\n' "$drivers" | while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      [ "$pid" = "$$" ] && continue
+      kill "$pid" 2>/dev/null && note "stopped driver pid $pid"
+    done
+    sleep 1
+  else
+    note "no driver running"
+  fi
+
+  # 2. Then this panel's boxes.
+  local names stopped=0 name
+  names="$(engine_running_boxes | grep "^claude-box-h-$INSTANCE_SLUG-" || true)"
+  if [ -n "$names" ]; then
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      engine_stop_box "$name" && note "stopped $name"
+      stopped=$((stopped + 1))
+    done <<< "$names"
+  fi
+  [ "$stopped" = 0 ] && note "no boxes were running for this panel"
+
+  # 3. A lock whose loop we just killed would block the next run.
+  if [ "$keep_lock" = 0 ] && [ -f "$INSTANCE_STATE/lock/owner" ]; then
+    local pid; pid="$(awk '{print $1}' "$INSTANCE_STATE/lock/owner" 2>/dev/null || true)"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$INSTANCE_STATE/lock"
+      note "released the loop lock"
+    fi
+  fi
+
+  # The containers are gone; the documents must stop claiming otherwise.
+  clear_dead_box_markers
+
+  echo
+  echo "stopped. in-flight work is left where it is — resume with:"
+  echo "  claude-box harness do --resume"
+}
+
+# --- history retention ---------------------------------------------------------
+# Runs, box logs, per-box config dirs and the numbers derived from them (activity, cost by
+# role) accumulate forever otherwise. They are diagnostics, not records — the record is the
+# panel's documents and git. Kept for a week by default, purgeable on demand.
+CLAUDE_BOX_HISTORY_DAYS="${CLAUDE_BOX_HISTORY_DAYS:-7}"
+
+# prune_history <days> [--dry-run] — never touches a running box's files.
+prune_history() {
+  local days="${1:-$CLAUDE_BOX_HISTORY_DAYS}" dry="${2:-}"
+  local cutoff running removed=0 f name
+  case "$days" in ''|*[!0-9]*) days=7 ;; esac
+  cutoff=$(( $(date +%s) - days * 86400 ))
+  running="$(engine_running_boxes || true)"
+
+  is_running() { printf '%s\n' "$running" | grep -qx "$1"; }
+
+  # box logs
+  for f in "$STATE_HOME/logs"/claude-box-*.log; do
+    [ -f "$f" ] || continue
+    name="$(basename "${f%.log}")"
+    is_running "$name" && continue
+    [ "$(file_mtime "$f")" -lt "$cutoff" ] || continue
+    if [ "$dry" = "--dry-run" ]; then echo "  would remove log $name"; else rm -f "$f"; fi
+    removed=$((removed + 1))
+  done
+
+  # per-box config dirs — each is a seeded ~/.claude, so these are the bulky ones
+  for f in "$STATE_HOME/boxes"/*; do
+    [ -d "$f" ] || continue
+    name="$(basename "$f")"
+    is_running "$name" && continue
+    [ "$(file_mtime "$f")" -lt "$cutoff" ] || continue
+    # The dir may hold the newest refresh token on this host; carry it back before it goes.
+    if [ "$dry" = "--dry-run" ]; then echo "  would remove box dir $name"; else reclaim_credentials "$name"; rm -rf "$f"; fi
+    removed=$((removed + 1))
+  done
+
+  # runs (ticks and `do` runs), and the exit records
+  local base
+  for base in "$STATE_HOME/harness"/*/ ; do
+    [ -d "$base" ] || continue
+    for f in "$base"ticks/*; do
+      [ -d "$f" ] || continue
+      [ "$(file_mtime "$f")" -lt "$cutoff" ] || continue
+      if [ "$dry" = "--dry-run" ]; then echo "  would remove run $(basename "$f")"; else rm -rf "$f"; fi
+      removed=$((removed + 1))
+    done
+    for f in "$base"exits/*; do
+      [ -f "$f" ] || continue
+      is_running "$(basename "$f")" && continue
+      [ "$(file_mtime "$f")" -lt "$cutoff" ] || continue
+      [ "$dry" = "--dry-run" ] || rm -f "$f"
+    done
+  done
+  printf '%s\n' "$removed"
+}
+
+cmd_harness_purge() {
+  local inst="" days="$CLAUDE_BOX_HISTORY_DAYS" all=0 yes=0 dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days)             days="${2:-}"; shift 2 ;;
+      --all)              all=1; shift ;;
+      --dry-run)          dry=1; shift ;;
+      -y|--yes)           yes=1; shift ;;
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      -*)                 die "unknown flag for 'harness purge': $1" ;;
+      *)                  inst="$1"; shift ;;
+    esac
+  done
+  resolve_instance "$inst"
+  [ "$all" = 1 ] && days=0
+
+  if [ "$dry" = 1 ]; then
+    echo "history older than ${days} day(s) — dry run:"
+    prune_history "$days" --dry-run
+    return 0
+  fi
+
+  echo "This removes box logs, per-box config dirs and run records older than ${days} day(s)"
+  echo "from $STATE_HOME. Diagnostics only — your panel documents, git history and PRs are"
+  echo "untouched, and a running box's files are skipped."
+  if [ "$yes" != 1 ]; then
+    if [ ! -t 0 ]; then die "refusing to purge non-interactively without -y"; fi
+    printf 'Proceed? [y/N] '
+    local reply; answer_open; reply="$(answer_read)"; answer_close; printf '\n'
+    case "$reply" in (y|Y|yes|YES) ;; (*) echo "aborted"; return 1 ;; esac
+  fi
+  local n; n="$(prune_history "$days")"
+  echo "purged $n item(s)"
+}
+
+# --- clean: throw the attempts away and start over -----------------------------
+# When the conventions change — a branch naming scheme, a policy about when a PR gets
+# opened — half-finished attempts are worth less than the confusion they cause. This
+# removes the worktrees and branches and resets the task documents to `ready`, keeping the
+# parts a human authored: the criteria, the answers, the questions.
+cmd_harness_clean() {
+  local inst="" project="" task="" yes=0 keep_remote=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      --project)          project="${2:-}"; shift 2 ;;
+      --task)             task="${2#/}"; shift 2 ;;
+      -y|--yes)           yes=1; shift ;;
+      --delete-remote)    keep_remote=0; shift ;;
+      -*)                 die "unknown flag for 'harness clean': $1" ;;
+      *)                  inst="$1"; shift ;;
+    esac
+  done
+  resolve_instance "$inst"
+  ensure_daemon
+
+  local files
+  if [ -n "$task" ]; then
+    files="$task"
+  else
+    files="$(cd "$INSTANCE" && find "projects${project:+/$project}" -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort)"
+  fi
+  [ -n "$files" ] || { echo "nothing to clean"; return 0; }
+
+  # A box still holding one of these would keep writing into a worktree we are deleting.
+  local running; running="$(engine_running_boxes | grep "^claude-box-h-$INSTANCE_SLUG-" || true)"
+  [ -n "$running" ] && die "these boxes are still running — 'claude-box stop --all' first:
+$(printf '%s\n' "$running" | sed 's/^/  /')"
+
+  echo "About to discard work in progress on $INSTANCE:"
+  local t doc wt_name repo_dir branch
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    doc="$INSTANCE/$t"
+    wt_name="$(worktree_name "$t")"
+    printf '  %-46s %-12s' "$t" "$(task_status "$doc")"
+    [ -d "$ROOT/_wt/$wt_name" ] && printf ' worktree' || printf '         '
+    printf '\n'
+  done <<< "$files"
+  echo
+  echo "It removes the worktrees and local branches, clears pr:/qa: and the # Result"
+  echo "section, and resets each task to ready. Criteria, questions and your answers stay."
+  [ "$keep_remote" = 1 ] && echo "Remote branches are LEFT ALONE (--delete-remote to remove them too)."
+  if [ "$yes" != 1 ]; then
+    if [ ! -t 0 ]; then die "refusing to discard work non-interactively without -y"; fi
+    printf 'Proceed? [y/N] '
+    local reply; answer_open; reply="$(answer_read)"; answer_close; printf '\n'
+    case "$reply" in (y|Y|yes|YES) ;; (*) echo "aborted"; return 1 ;; esac
+  fi
+
+  # Reset the DOCUMENTS first: it is instant, and it is what you need to start over. Then do
+  # the filesystem work, which on a monorepo worktree means deleting ~200k files and can
+  # take minutes — you should not be waiting on that to see a clean board.
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    python3 - "$INSTANCE/$t" <<'PY_RESET'
+import re, sys
+path = sys.argv[1]
+text = open(path, errors="replace").read()
+end = text.index("\n---", 3) if text.startswith("---") else -1
+front, body = (text[:end], text[end:]) if end > 0 else (text, "")
+# Terminal states are decisions, not attempts: a task you cancelled must stay cancelled,
+# and a done task must not be rebuilt. Only in-flight attempts reset.
+status = re.search(r"^status: *(.*)$", front, re.M)
+if status and status.group(1).strip() in ("cancelled", "done"):
+    print("kept %s at %s" % (path, status.group(1).strip()))
+    raise SystemExit(0)
+front = re.sub(r"^status: .*$", "status: ready", front, count=1, flags=re.M)
+front = re.sub(r"^assignee:.*$", "assignee:", front, count=1, flags=re.M)
+front = re.sub(r"^qa:.*$", "qa:", front, count=1, flags=re.M)
+front = re.sub(r"^pr: \[[^\]]*\]", "pr: [ ]", front, count=1, flags=re.M | re.S)
+# A # Result describes an attempt that no longer exists.
+body = re.split(r"\n# Result", body)[0]
+open(path, "w").write(front + body.rstrip() + "\n")
+PY_RESET
+  done <<< "$files"
+  echo "task documents reset to ready (criteria, questions and your answers kept)"
+
+  # Branches and worktrees.
+  local t doc wt_name repo_dir branch legacy
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    doc="$INSTANCE/$t"
+    wt_name="$(worktree_name "$t")"
+    legacy="$(basename "${t%.md}")"
+    repo_dir="$ROOT/$(task_field "$doc" target_repo | sed 's|.*/||')"
+    [ -d "$repo_dir/.git" ] || [ -f "$repo_dir/.git" ] || continue
+
+    for branch in $(git -C "$repo_dir" branch --format='%(refname:short)' 2>/dev/null \
+                      | grep -E "(^|/)$legacy(-|$)" || true); do
+      git -C "$repo_dir" branch -D "$branch" >/dev/null 2>&1 && note "deleted branch $branch"
+      if [ "$keep_remote" = 0 ]; then
+        git -C "$repo_dir" push origin --delete "$branch" >/dev/null 2>&1 \
+          && note "deleted remote branch $branch"
+      fi
+    done
+
+    local wt
+    for wt in "$wt_name" "$legacy"; do
+      [ -d "$ROOT/_wt/$wt" ] || continue
+      note "removing worktree _wt/$wt (a monorepo worktree is large; this takes a while)"
+      git -C "$repo_dir" worktree remove --force "$ROOT/_wt/$wt" 2>/dev/null \
+        || rm -rf "$ROOT/_wt/$wt"
+    done
+    git -C "$repo_dir" worktree prune 2>/dev/null || true
+  done <<< "$files"
+
+  echo
+  echo "clean. start over with:  claude-box harness do --resume${project:+ --project $project}"
+}
+
+# `clean` discards an ATTEMPT and keeps the task. `delete` removes the documents
+# themselves — the one operation the panel had no way to undo by hand without leaving
+# dangling index links and orphaned worktrees behind.
+#
+# The panel is often a git repo with nothing committed and no remote, so a deleted
+# document is gone for good. Everything therefore moves to a trash directory under the
+# instance state by default; --purge is the explicit opt-out.
+cmd_harness_delete() {
+  local inst="" project="" task="" objective="" yes=0 keep_remote=1 dry=0 purge=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --instance|--panel) inst="${2:-}"; shift 2 ;;
+      --project)          project="${2:-}"; shift 2 ;;
+      --task)             task="${2#/}"; shift 2 ;;
+      --objective)        objective="${2#/}"; shift 2 ;;
+      -y|--yes)           yes=1; shift ;;
+      --delete-remote)    keep_remote=0; shift ;;
+      --dry-run)          dry=1; shift ;;
+      --purge)            purge=1; shift ;;
+      -*)                 die "unknown flag for 'harness delete': $1" ;;
+      *)                  if [ -z "$inst" ] && [ -d "$1" ]; then inst="$1";
+                          elif [ -z "$task" ] && [ -z "$project" ]; then
+                            case "$1" in *.md) task="${1#/}" ;; *) project="$1" ;; esac
+                          else die "unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  resolve_instance "$inst"
+  ensure_daemon
+
+  local targets=0
+  [ -n "$project" ]   && targets=$((targets + 1))
+  [ -n "$task" ]      && targets=$((targets + 1))
+  [ -n "$objective" ] && targets=$((targets + 1))
+  [ "$targets" -eq 0 ] && die "say what to delete: --project <slug>, --task projects/<slug>/tasks/<id>.md, or --objective <slug>"
+  [ "$targets" -gt 1 ] && die "--project, --task and --objective are different operations; pass one"
+
+  # A slug is a directory NAME under projects/, never a path. This is the whole
+  # containment check for the project case.
+  local target_dir="" files=""
+  if [ -n "$project" ]; then
+    project="$(basename "$project")"
+    case "$project" in ""|.|..) die "not a project slug: $project" ;; esac
+    target_dir="projects/$project"
+    [ -d "$INSTANCE/$target_dir" ] || die "no such project: $target_dir"
+    files="$(cd "$INSTANCE" && find "$target_dir" -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort)"
+  elif [ -n "$objective" ]; then
+    # An objective is a single document with no tasks, no worktree and no branch. It is
+    # here rather than in its own command because everything that follows — trash, index
+    # links, dangling references — is identical.
+    objective="$(basename "$objective")"; objective="${objective%.md}"
+    case "$objective" in ""|.|..) die "not an objective slug: $objective" ;; esac
+    [ -f "$INSTANCE/objectives/$objective.md" ] || die "no such objective: objectives/$objective.md"
+  else
+    case "$task" in
+      projects/*/tasks/*.md) ;;
+      *) die "not a task path: $task (want projects/<slug>/tasks/<id>.md)" ;;
+    esac
+    case "$task" in *..*) die "not a task path: $task" ;; esac
+    [ -f "$INSTANCE/$task" ] || die "no such task: $task"
+    files="$task"
+  fi
+
+  # What is being removed, as one bundle-relative path. Everything below works off this.
+  local removed="${target_dir:-${objective:+objectives/$objective.md}}"
+  removed="${removed:-$task}"
+
+  # A box still holding one of these would keep writing into a worktree we are removing,
+  # and would rewrite the very document we just deleted.
+  local running; running="$(engine_running_boxes | grep "^claude-box-h-$INSTANCE_SLUG-" || true)"
+  [ -n "$running" ] && die "these boxes are still running — 'claude-box stop --all' first:
+$(printf '%s\n' "$running" | sed 's/^/  /')"
+
+  # Anything OUTSIDE what we are deleting that points INTO it. A task whose depends_on
+  # names a document that no longer exists never becomes dispatchable, and nothing else
+  # in the harness would tell you why.
+  # A prefix match, so deleting a project also catches links to its project.md and index.md,
+  # not only to its tasks.
+  local refs
+  refs="$(cd "$INSTANCE" && grep -rlF "/$removed" --include='*.md' projects objectives knowledge 2>/dev/null \
+            | grep -v "^$removed" | sort || true)"
+
+  echo "About to delete from $INSTANCE:"
+  if [ -n "$project" ]; then
+    echo "  $target_dir/  (the whole project directory)"
+  elif [ -n "$objective" ]; then
+    echo "  $removed  ($(task_field "$INSTANCE/$removed" status))"
+  fi
+  local t doc wt_name
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    doc="$INSTANCE/$t"
+    wt_name="$(worktree_name "$t")"
+    printf '  %-46s %-12s' "$t" "$(task_status "$doc")"
+    [ -d "$ROOT/_wt/$wt_name" ] && printf ' worktree' || printf '         '
+    local prs; prs="$(task_field "$doc" pr | tr -d '[] ')"
+    [ -n "$prs" ] && printf ' pr:%s' "$prs"
+    printf '\n'
+  done <<< "$files"
+
+  if [ -n "$refs" ]; then
+    echo
+    echo "These documents reference what you are deleting and will be left dangling:"
+    printf '%s\n' "$refs" | sed 's/^/  /'
+  fi
+
+  echo
+  local wt_count=0 t_c
+  while IFS= read -r t_c; do
+    [ -n "$t_c" ] || continue
+    [ -d "$ROOT/_wt/$(worktree_name "$t_c")" ] && wt_count=$((wt_count + 1))
+  done <<< "$files"
+  if [ "$wt_count" -gt 0 ]; then
+    echo "$wt_count worktree(s) go with it. A monorepo worktree is ~200k files, so this"
+    echo "takes a minute or two each — the board clears first, the disk work runs after."
+  fi
+  echo "Open pull requests are NOT touched — close them yourself if they should not land."
+  if [ "$purge" = 1 ]; then
+    echo "--purge: documents are deleted outright, with no copy kept."
+  else
+    echo "Documents move to $INSTANCE_STATE/trash/ (--purge to delete outright)."
+  fi
+  [ "$keep_remote" = 1 ] && echo "Remote branches are LEFT ALONE (--delete-remote to remove them too)."
+
+  if [ "$dry" = 1 ]; then echo; echo "--dry-run: nothing was deleted"; return 0; fi
+
+  # A whole project is worth more than a y/N. Typing the slug is the difference between
+  # confirming a thing and confirming a prompt.
+  if [ "$yes" != 1 ]; then
+    if [ ! -t 0 ]; then die "refusing to delete non-interactively without -y"; fi
+    local reply; answer_open
+    if [ -n "$project" ]; then
+      printf 'Type the project slug to confirm (%s): ' "$project"
+      reply="$(answer_read)"; answer_close; printf '\n'
+      [ "$reply" = "$project" ] || { echo "aborted"; return 1; }
+    else
+      printf 'Proceed? [y/N] '
+      reply="$(answer_read)"; answer_close; printf '\n'
+      case "$reply" in (y|Y|yes|YES) ;; (*) echo "aborted"; return 1 ;; esac
+    fi
+  fi
+
+  # Read what the filesystem cleanup needs BEFORE the documents move: target_repo lives in
+  # the frontmatter, and it is gone once the document is in the trash.
+  local legacy repo_dir branch wt plan
+  plan="$(mktemp "${TMPDIR:-/tmp}/cb-delete.XXXXXX")"
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    doc="$INSTANCE/$t"
+    repo_dir="$ROOT/$(task_field "$doc" target_repo | sed 's|.*/||')"
+    printf '%s\t%s\t%s\n' "$(worktree_name "$t")" "$(basename "${t%.md}")" "$repo_dir" >> "$plan"
+  done <<< "$files"
+
+  # The documents. These move FIRST: it is instant, and it is what makes the board correct.
+  # The filesystem work below can take minutes per monorepo worktree, and nobody should be
+  # staring at a project that is already deleted while it runs.
+  if [ "$purge" = 1 ]; then
+    rm -rf "${INSTANCE:?}/$removed"
+    echo "deleted $removed"
+  else
+    local stamp trash; stamp="$(date +%Y%m%d-%H%M%S)"
+    trash="$INSTANCE_STATE/trash/$stamp"
+    mkdir -p "$trash/$(dirname "$removed")"
+    mv "$INSTANCE/$removed" "$trash/$removed"
+    echo "deleted $removed"
+    echo "a copy is in $trash — restore with:"
+    echo "  cp -R '$trash/$removed' '$INSTANCE/$removed'"
+  fi
+
+  # Index listings. An index.md line is `* [Title](/path/to/doc.md) - description`, so a
+  # link to a document that no longer exists is a dead row on the board.
+  local idx
+  while IFS= read -r idx; do
+    [ -n "$idx" ] || continue
+    python3 - "$INSTANCE/$idx" "$removed" <<'PY_INDEX'
+import sys
+path, gone = sys.argv[1], sys.argv[2]
+lines = open(path, errors="replace").read().splitlines(True)
+kept = [ln for ln in lines if ("(/%s" % gone) not in ln and ("(%s" % gone) not in ln]
+if len(kept) != len(lines):
+    open(path, "w").write("".join(kept))
+    print("  dropped %d link(s) from %s" % (len(lines) - len(kept), path))
+PY_INDEX
+  done <<< "$(cd "$INSTANCE" && find . -name 'index.md' -not -path './.git/*' 2>/dev/null | sed 's|^\./||' | sort)"
+
+  # Now the slow part, off the plan captured before the documents moved.
+  while IFS=$'\t' read -r wt_name legacy repo_dir; do
+    [ -n "$wt_name" ] || continue
+    [ -d "$repo_dir/.git" ] || [ -f "$repo_dir/.git" ] || continue
+    for wt in "$wt_name" "$legacy"; do
+      [ -d "$ROOT/_wt/$wt" ] || continue
+      note "removing worktree _wt/$wt (a monorepo worktree is large; this takes a while)"
+      git -C "$repo_dir" worktree remove --force "$ROOT/_wt/$wt" 2>/dev/null \
+        || rm -rf "$ROOT/_wt/$wt"
+    done
+    git -C "$repo_dir" worktree prune 2>/dev/null || true
+
+    # After the worktree is gone: a branch checked out in one cannot be deleted.
+    for branch in $(git -C "$repo_dir" branch --format='%(refname:short)' 2>/dev/null \
+                      | grep -E "(^|/)$legacy(-|$)" || true); do
+      git -C "$repo_dir" branch -D "$branch" >/dev/null 2>&1 && note "deleted branch $branch"
+      if [ "$keep_remote" = 0 ]; then
+        git -C "$repo_dir" push origin --delete "$branch" >/dev/null 2>&1 \
+          && note "deleted remote branch $branch"
+      fi
+    done
+  done < "$plan"
+  rm -f "$plan"
+
+  # Recomputed, not the list from before: the index pass above has already repaired every
+  # link it owns, and naming those again sends you to look at a file that is already correct.
+  refs="$(cd "$INSTANCE" && grep -rlF "/$removed" --include='*.md' projects objectives knowledge 2>/dev/null \
+            | grep -v "^$removed" | sort || true)"
+  if [ -n "$refs" ]; then
+    echo
+    echo "Still referencing what you deleted — fix these by hand:"
+    printf '%s\n' "$refs" | sed 's/^/  /'
+  fi
+}
+
+# The worktree directory for a task: project-scoped, because task ids repeat.
+worktree_name() {
+  local path="${1#/}" project stem
+  stem="$(basename "${path%.md}")"
+  project="$(printf '%s' "$path" | awk -F/ '{ if ($1 == "projects") print $2 }')"
+  if [ -n "$project" ]; then printf '%s-%s\n' "$(slug "$project")" "$stem"; else printf '%s\n' "$stem"; fi
 }
 
 # --- one request, driven to completion ----------------------------------------
@@ -1178,6 +2846,10 @@ CLAUDE_BOX_CI_TIMEOUT="${CLAUDE_BOX_CI_TIMEOUT:-900}"
 run_role_sync() {
   local role="$1" task="$2" repo="$3" label="$4"
   local model sys name log effort code
+  # resolve_target FIRST: ensure_task_worktree runs a housekeeping box, and box_exec needs
+  # MOUNT_SRC/WORKDIR set or it mounts nothing and every git command inside fails.
+  resolve_target "$INSTANCE"
+  ensure_task_worktree "$task" "$repo" || true
   model="$(role_model "$role")"
   effort="$(role_effort "$role" "$model")"
   sys="$(role_system_prompt "$role" "$repo")"
@@ -1187,27 +2859,233 @@ run_role_sync() {
   rm -f "$INSTANCE_STATE/exits/$name"
   printf '%s\n' "$name" > "$INSTANCE_STATE/inflight/$(task_key "$task")"
 
-  local claude_args=(claude --permission-mode bypassPermissions --model "$model")
+  # No subagents in a role box. A subagent's output is a file the parent then waits for, and
+  # a box that waits is a box burning its budget: one lead-dev spent eleven minutes in
+  # `until [ -f <task output> ]`. The box IS the unit of parallelism here — the host runs
+  # several of them — so the tool buys nothing and costs runs.
+  local claude_args=(claude --permission-mode bypassPermissions --model "$model"
+                     --output-format stream-json --verbose --disallowed-tools Task)
   [ -n "$effort" ] && claude_args+=(--effort "$effort")
-  claude_args+=(--append-system-prompt "$sys"
-                -p "$label
+  local where=""
+  if [ -n "$TASK_WORKTREE" ]; then
+    where="
 
-Task document: $task (bundle-relative, this panel's root is your working directory).
+Your worktree has already been created for you:
+  path:   $TASK_WORKTREE
+  branch: $TASK_BRANCH  (already checked out)
+  base:   ${TASK_BASE:-the remote default branch}
+Work THERE. Do not create another worktree, do not create another branch, and never place
+a worktree inside the repository itself — that turns the whole checkout into untracked
+files on the human's main branch.
+
+Your branch is based on \`${TASK_BASE:-the default branch}\`. If that is NOT the repository's
+default branch, this is a STACKED pull request: open it with \`gh pr create --base ${TASK_BASE#origin/}\`
+so the diff shows only your change, and say in the body which PR it sits on top of. Opening it
+against the default branch instead would show your dependency's work as if it were yours, which
+is what makes a stack look like a pile."
+  fi
+  task_merge_state "$INSTANCE/$task" "$task" "$repo"
+  # Mechanical first: if the only problem is that the base moved, fix it here and re-ask.
+  if [ "$PR_MERGE_STATE" = CONFLICTING ] \
+     && task_autorebase "$task" "$repo" "${PR_MERGE_BASE:-${TASK_BASE#origin/}}"; then
+    # git just replayed this branch onto its base with no conflict, which settles the question
+    # more authoritatively than GitHub's lazily-recomputed field — that still answers with the
+    # pre-push value for a while, and warning the box about a conflict it no longer has would
+    # send it looking for something that is not there.
+    PR_MERGE_STATE=MERGEABLE
+  fi
+  local conflict=""
+  if ! task_stack_conflicts "$task" "$repo"; then
+    conflict="
+
+## Your branch does not merge as part of its stack
+
+Merging your branch against the other branches in this stack conflicts:
+
+$(printf '%s' "$STACK_CONFLICTS" | sed 's/^/    /')
+
+This is why your own base merges clean and GitHub still refuses: a stack is merged as a whole,
+so two branches adding the SAME path with different content collide even when neither conflicts
+with its own base.
+
+**Shared infrastructure belongs to one task — the lowest one in the stack that needs it.** A CI
+workflow, a fixture directory, a shared helper: if a branch below yours already adds that file,
+do not add your own copy. Rebase onto it so you inherit it, and if it needs a change, make the
+change there if that branch is yours to touch, or say what change it needs in your PR body. Fix
+this before other work: nothing merges until it is gone."
+  elif [ "$PR_MERGE_STATE" = CONFLICTING ]; then
+    conflict="
+
+## Your pull request does not merge
+
+GitHub reports this task's pull request as CONFLICTING against \`${PR_MERGE_BASE:-its base}\`.
+Your worktree is not where this shows up — it can be perfectly clean while the base branch has
+moved underneath it, which is normal in a stack. Fix that FIRST, before any other work:
+
+    git fetch origin
+    git rebase origin/${PR_MERGE_BASE:-<base>}
+    # resolve, then: git push --force-with-lease
+
+A conflicting pull request cannot be merged or reviewed usefully, so nothing else you do this
+round counts until it merges cleanly again."
+  fi
+  claude_args+=(--append-system-prompt "$sys"
+                -p "$label${conflict}
+
+Task document: $task (bundle-relative, this panel's root is your working directory).$where
 Follow your role definition and the executor rules in your system prompt. Report by updating the task document.")
 
   resolve_target "$INSTANCE"
   EXTRA_RUN_ARGS=(-e IS_SANDBOX=1)
   note "  → $role on $(basename "$task") ($model${effort:+, $effort})"
+  local status_before; status_before="$(task_status "$INSTANCE/$task")"
+  task_mark_working "$INSTANCE/$task" "$role" "$name"
   run_box_bg "$name" isolated "$log" "$INSTANCE_STATE/exits/$name" "${claude_args[@]}"
-  wait_for_box "$name" "$INSTANCE_STATE/exits/$name" || true
+  wait_for_box "$name" "$INSTANCE_STATE/exits/$name" "$log" || true
   code="$(cat "$INSTANCE_STATE/exits/$name" 2>/dev/null || echo unknown)"
+  # A dead credential is not this task's problem, and it will kill every box after this one.
+  # Put the document back the way it was and stop the run rather than marking nine tasks
+  # blocked for a reason that has nothing to do with them.
+  if box_auth_failed "$log"; then
+    set_task_field "$INSTANCE/$task" status "$status_before"
+    set_task_field "$INSTANCE/$task" box ""
+    rm -f "$INSTANCE_STATE/inflight/$(task_key "$task")"
+    die "the box could not authenticate — the shared Claude session is expired.
+
+  $log
+
+Nothing was charged to $(basename "$task"): its status is back to '$status_before'.
+
+Log in once, in your own terminal (it needs a TTY):
+
+  claude-box            # then /login, then exit
+
+Then carry on where this stopped:
+
+  claude-box harness do --resume"
+  fi
+  task_reconcile "$INSTANCE/$task" "$code"
+  # A stacked PR's diff is already right; this is what makes GitHub show the chain.
+  [ "$(fm_list_count "$INSTANCE/$task" pr)" -gt 0 ] && link_stack "$task" "$repo"
+  # And if every gate now passes, the draft is finished work — hand it to the human.
+  pr_ready_if_finished "$task" "$repo"
   reclaim_credentials "$name"
   rm -f "$INSTANCE_STATE/inflight/$(task_key "$task")"
   note "    exit $code — $log"
   [ "$code" = 0 ]
 }
 
-task_field() { awk -F': *' -v k="$2" '$1 == k { print $2; exit }' "$1" 2>/dev/null; }
+# One scalar out of the frontmatter. Three things this has to get right, each learned the
+# hard way: a value may itself contain ": " (a `-F': *'` split truncated a blocked_reason at
+# the first colon), a value may be quoted (`blocked_reason: ""` read back as the two-character
+# string `""`, so an emptiness check said "not empty" and a stalled task never normalised),
+# and the search stops at the closing `---` so prose in the body cannot impersonate a field.
+task_field() {
+  awk -v k="$2" '
+    NR == 1 && $0 == "---" { next }
+    $0 == "---" { exit }
+    index($0, k ":") == 1 {
+      v = substr($0, length(k) + 2)
+      sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
+      q = substr(v, 1, 1)
+      if (length(v) > 1 && (q == "\"" || q == "'"'"'") && substr(v, length(v), 1) == q)
+        v = substr(v, 2, length(v) - 2)
+      print v; exit
+    }
+  ' "$1" 2>/dev/null
+}
+
+# Items of a YAML flow array, one per line. The PM writes these across MULTIPLE lines
+# once they are longer than a few words:
+#
+#   open_questions: [
+#     "Q1: …",
+#     "Q2: …"
+#   ]
+#
+# A single-line `awk -F': *'` on that yields "[" — which is how a blocking question got
+# rendered to the user as a bare bracket, and how an emptiness check nearly passed for the
+# wrong reason. Read the whole array.
+fm_list_items() {
+  local file="$1" key="$2"
+  python3 - "$file" "$key" <<'PY_LIST'
+import re, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    text = open(path, errors="replace").read()
+except OSError:
+    raise SystemExit(0)
+# Frontmatter only: the body may legitimately mention the key in prose. Split on the
+# CLOSING DELIMITER LINE, not on every "---" in the file — an answered question contains
+# " --- " by design, and splitting on that truncated the frontmatter and hid every field
+# after the first answer.
+front = text
+if text.startswith("---"):
+    match_end = re.search(r"^---[ \t]*$", text[3:], re.M)
+    front = text[3:3 + match_end.start()] if match_end else text[3:]
+match = re.search(r"^%s:[ 	]*(.*?)$" % re.escape(key), front, re.M)
+if not match:
+    raise SystemExit(0)
+rest = front[match.start(1):]
+if not rest.lstrip().startswith("["):
+    value = match.group(1).strip()
+    if value:
+        print(value)
+        raise SystemExit(0)
+    # A BLOCK list: `key:` on its own line, then indented `- item` lines. The
+    # project-manager writes criteria this way because they are long, and reading only the
+    # flow form counted them as zero — which silently disabled autonomy promotion (a task
+    # with criteria looked unrefined) and hid open questions from `harness answer`.
+    for line in front[match.end():].splitlines():
+        if line.strip() and not line[:1].isspace():
+            break                       # dedented: the next frontmatter key
+        item = line.strip()
+        if not item.startswith("- "):
+            continue
+        item = item[2:].strip()
+        if item[:1] in "\"'" and item[-1:] == item[:1] and len(item) > 1:
+            item = item[1:-1]
+        if item:
+            print(item)
+    raise SystemExit(0)
+depth, buf = 0, []
+for ch in rest:
+    if ch == "[":
+        depth += 1
+        if depth == 1:
+            continue
+    elif ch == "]":
+        depth -= 1
+        if depth == 0:
+            break
+    buf.append(ch)
+inner = "".join(buf)
+# Split on commas that are not inside quotes.
+items, cur, quote = [], "", None
+for ch in inner:
+    if quote:
+        if ch == quote:
+            quote = None
+        cur += ch
+    elif ch in "\"'":
+        quote = ch
+        cur += ch
+    elif ch == ",":
+        items.append(cur)
+        cur = ""
+    else:
+        cur += ch
+items.append(cur)
+for item in items:
+    item = item.strip().strip("\n").strip()
+    if item[:1] in "\"'" and item[-1:] == item[:1]:
+        item = item[1:-1]
+    if item:
+        print(item)
+PY_LIST
+}
+
+fm_list_count() { fm_list_items "$1" "$2" | grep -c . || true; }
 
 # Wait for CI to reach a verdict. The one honest poll in the system: CI runs on someone
 # else's schedule, so the alternative to polling is not knowing.
@@ -1226,14 +3104,40 @@ wait_for_ci() {
   done
 }
 
+# Is anything in scope still workable? A review that requests changes puts a task back in the
+# queue BEHIND the cursor, so a single forward pass strands it until someone re-runs the
+# command by hand. This is how the pipeline knows another pass is worth making.
+scope_actionable() {
+  local files="$1" t running
+  running="$(engine_running_boxes || true)"
+  local old_ifs="$IFS"; IFS=$'\n'
+  for t in $files; do
+    [ -n "$t" ] || continue
+    case "$(task_status "$INSTANCE/$t")" in
+      (ready|in-progress) ;;
+      (*) continue ;;
+    esac
+    # Something already working it is not a reason for another pass. Box names end in the
+    # task stem (plus unique_name's -N), so match that suffix: a substring match made t1
+    # see t10's box as its own and stop the pass with t1 stranded.
+    printf '%s\n' "$running" | grep -qE -- "-$(slug "$(basename "${t%.md}")")(-[0-9]+)?\$" && continue
+    IFS="$old_ifs"; return 0
+  done
+  IFS="$old_ifs"; return 1
+}
+
 cmd_harness_do() {
-  local inst="" desc="" project="" repo="" rounds=2 dry=0
+  local inst="" desc="" project="" repo="" rounds="$CLAUDE_BOX_QA_ROUNDS" dry=0 resume=0 retry=0 only_task="" passes=3
   while [ $# -gt 0 ]; do
     case "$1" in
+      --resume)           resume=1; shift ;;
+      --retry|--include-blocked) resume=1; retry=1; shift ;;
+      --task)             resume=1; only_task="${2#/}"; shift 2 ;;
       --instance|--panel) inst="${2:-}"; shift 2 ;;
       --project)          project="${2:-}"; shift 2 ;;
       --repo)             repo="${2:-}"; shift 2 ;;
       --max-rounds)       rounds="${2:-}"; shift 2 ;;
+      --passes)           passes="${2:-}"; shift 2 ;;
       --dry-run)          dry=1; shift ;;
       -*)                 die "unknown flag for 'harness do': $1" ;;
       *)
@@ -1243,12 +3147,41 @@ cmd_harness_do() {
         shift ;;
     esac
   done
-  [ -n "$desc" ] || die "usage: claude-box harness do [<panel>] \"<what you want>\" [--repo <name>] [--max-rounds N]"
+  if [ "$resume" = 0 ] && [ -z "$desc" ]; then
+    die "usage: claude-box harness do [<panel>] \"<what you want>\" [--repo <name>] [--max-rounds N (default $CLAUDE_BOX_QA_ROUNDS)]
+       claude-box harness do --resume [--project <slug>]     continue work already drafted"
+  fi
   resolve_instance "$inst"
   ensure_daemon
   local mode; mode="$(autonomy_mode)"
   [ "$dry" = 1 ] || require_login
+  if [ "$dry" != 1 ] && [ -n "$(gh_scopes)" ] && ! gh_has_scope workflow; then
+    note "the shared gh token has no 'workflow' scope, so no box can add a CI job —
+    a task whose verification needs one will block on that. Grant it once:
+      gh auth refresh -h github.com -s workflow"
+  fi
 
+  if [ "$dry" = 1 ] && [ "$resume" = 1 ]; then
+    echo "would resume work already drafted on $INSTANCE (autonomy: $mode):"
+    if [ -n "$only_task" ]; then
+      printf '  %-46s %s\n' "$only_task" "$(task_status "$INSTANCE/$only_task")"
+    else
+      ( cd "$INSTANCE" && find "projects${project:+/$project}" -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort ) \
+        | while IFS= read -r t; do
+            local st note_; st="$(task_status "$INSTANCE/$t")"; note_=""
+            if [ "$st" = blocked ] && blocked_retryable "$INSTANCE/$t"; then note_="  (retryable — resume takes it)"; fi
+            printf '  %-46s %s%s\n' "$t" "$st" "$note_"
+          done
+      echo
+      if [ "$retry" = 1 ]; then
+        echo "  ready/in-progress/in-review/blocked are picked up; done and cancelled are skipped"
+      else
+        echo "  ready, in-progress, in-review and blocks the host wrote (a box that stopped early)"
+        echo "  are picked up; done, cancelled and blocks a role reasoned to need --retry"
+      fi
+    fi
+    return 0
+  fi
   if [ "$dry" = 1 ]; then
     echo "would drive this to completion on $INSTANCE (autonomy: $mode):"
     echo "  1. project-manager drafts the documents"
@@ -1261,41 +3194,116 @@ cmd_harness_do() {
     return 0
   fi
 
-  # 1. Draft.
-  echo "── drafting ─────────────────────────────────────────────"
-  local before after created
-  before="$(mktemp)"; after="$(mktemp)"
-  ( cd "$INSTANCE" && find projects -type f -name '*.md' 2>/dev/null | sort ) > "$before"
-  # Not swallowed: when drafting fails, its diagnosis is the only useful output there is.
-  cmd_harness_new "$INSTANCE" "$desc" ${project:+--project "$project"} ${repo:+--repo "$repo"} || true
-  ( cd "$INSTANCE" && find projects -type f -name '*.md' 2>/dev/null | sort ) > "$after"
-  created="$(comm -13 "$before" "$after" | grep '/tasks/' || true)"
-  rm -f "$before" "$after"
+  local created
+  if [ "$resume" = 1 ]; then
+    # Resume: work the panel already holds. Re-drafting would duplicate the project, so
+    # this path never calls the project-manager.
+    echo "── resuming ─────────────────────────────────────────────"
+    local scope="projects"
+    [ -n "$project" ] && scope="projects/$project"
+    board_normalise "$scope"
+    if [ -n "$only_task" ]; then
+      [ -f "$INSTANCE/$only_task" ] || die "no task at $INSTANCE/$only_task"
+      created="$only_task"
+    else
+      # --retry includes blocked work, which is what you want after changing a policy the
+      # blocked task was judged against.
+      created="$(cd "$INSTANCE" && find "$scope" -type f -name '*.md' -path '*/tasks/*' 2>/dev/null | sort | while IFS= read -r f; do
+        case "$(task_status "$INSTANCE/$f")" in
+          (draft|ready|in-progress|in-review) printf '%s\n' "$f" ;;
+          # Written as an if, not as a test-and-printf: the latter leaves the loop's exit
+          # status at 1 whenever the test fails, which fails the enclosing command
+          # substitution and, under set -e, silently kills the whole run. That is exactly
+          # what made --resume a no-op on a panel containing blocked tasks.
+          # (No backticks in comments inside a command substitution, either — bash's parser
+          # treats them as a nested substitution and swallows the rest of the file.)
+          (blocked) if [ "$retry" = 1 ] || blocked_retryable "$INSTANCE/$f"; then printf '%s\n' "$f"; fi ;;
+        esac
+      done)"
+    fi
+    if [ -z "$created" ]; then
+      echo "  nothing to resume in $scope — every task is done, cancelled, or blocked on a"
+      echo "  reason a role gave (\`--retry\` re-dispatches those; \`harness status\` lists them)"
+      return 0
+    fi
+    printf '%s\n' "$created" | while IFS= read -r t; do
+      printf '  %-46s %s\n' "$t" "$(task_status "$INSTANCE/$t")"
+    done
 
-  if [ -z "$created" ]; then
-    echo
-    echo "no task documents were created — nothing downstream can run."
-    echo "the drafting output above says why; a sharper request is the LAST thing to suspect."
-    return 1
+    # Answers you gave are still sitting in open_questions; until the PM folds them in and
+    # clears them, the host will not promote — so do that first, in one box.
+    if answers_pending "$created"; then
+      echo
+      echo "── folding in your answers ──────────────────────────────"
+      fold_answers "$created" || true
+      # Cancelled and still-blocked tasks drop out of the run here.
+      created="$(printf '%s\n' "$created" | while IFS= read -r t; do
+        case "$(task_status "$INSTANCE/$t")" in
+          (draft|ready|in-progress|in-review) printf '%s\n' "$t" ;;
+          (*) printf '  dropped %s (now %s)\n' "$t" "$(task_status "$INSTANCE/$t")" >&2 ;;
+        esac
+      done)"
+    fi
+  else
+    # 1. Draft.
+    echo "── drafting ─────────────────────────────────────────────"
+    local before after
+    before="$(mktemp)"; after="$(mktemp)"
+    ( cd "$INSTANCE" && find projects -type f -name '*.md' 2>/dev/null | sort ) > "$before"
+    # Not swallowed: when drafting fails, its diagnosis is the only useful output there is.
+    cmd_harness_new "$INSTANCE" "$desc" --terse ${project:+--project "$project"} ${repo:+--repo "$repo"} || true
+    ( cd "$INSTANCE" && find projects -type f -name '*.md' 2>/dev/null | sort ) > "$after"
+    created="$(comm -13 "$before" "$after" | grep '/tasks/' || true)"
+    rm -f "$before" "$after"
+
+    if [ -z "$created" ]; then
+      echo
+      echo "no task documents were created — nothing downstream can run."
+      echo "the drafting output above says why; a sharper request is the LAST thing to suspect."
+      return 1
+    fi
   fi
-  printf '%s\n' "$created" | sed 's/^/  drafted /'
 
   # 2. Anything waiting on a human stops here: nothing downstream can answer it.
-  local blocked=0 t
+  local blocked=0 blocked_files="" t
+  # After a fold-in the PM may have raised a NEW question; check the current state, not the
+  # state we started from.
   while IFS= read -r t; do
     [ -n "$t" ] || continue
-    local q; q="$(task_field "$INSTANCE/$t" open_questions)"
-    case "$q" in ''|'[]'|'[ ]') ;; *)
-      echo
-      echo "  $t is waiting on you:"
-      printf '%s\n' "$q" | sed 's/^/    /'
-      blocked=1 ;;
-    esac
+    [ "$(fm_list_count "$INSTANCE/$t" open_questions)" -gt 0 ] || continue
+    echo
+    echo "  $INSTANCE/$t"
+    echo "  is waiting on you:"
+    fm_list_items "$INSTANCE/$t" open_questions | fold -s -w 88 | sed 's/^/    /'
+    blocked=1
+    blocked_files="$blocked_files$t"$'\n'
   done <<< "$created"
+
+  if [ "$blocked" = 1 ]; then
+    # Ask them here rather than sending the user off to hand-edit YAML — that was the
+    # instruction, and it was bad advice.
+    if [ -t 0 ]; then
+      echo
+      printf 'Answer them now? [Y/n] '
+      local reply
+      answer_open; reply="$(answer_read)"; answer_close
+      printf '\n' 
+      case "$reply" in
+        (''|y|Y|yes|YES)
+          if answer_interactively "$blocked_files"; then
+            blocked=0
+            echo
+            echo "── continuing ───────────────────────────────────────────"
+          fi ;;
+      esac
+    fi
+  fi
+
   if [ "$blocked" = 1 ]; then
     echo
-    echo "Answer inline in the task document — append ' --- <your answer>' to the question — then:"
-    echo "  ./claude-box harness do \"$desc\"    (or ./claude-box harness tick to pick it up)"
+    echo "Those tasks stay blocked until the questions are answered:"
+    echo "  claude-box harness answer                 # asks them one at a time"
+    echo "  claude-box harness do --resume            # continue afterwards"
     return 2
   fi
 
@@ -1309,35 +3317,118 @@ cmd_harness_do() {
     echo "  then re-run this command, or: ./claude-box harness autonomy promote"
     return 3
   fi
-  TICK_DIR="$INSTANCE_STATE/ticks/do-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$TICK_DIR"
+  TICK_DIR="$INSTANCE_STATE/ticks/do-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$TICK_DIR/logs"
+  printf 'run %s\nkind do\ninstance %s\nstarted %s\nautonomy %s\n' \
+    "$(basename "$TICK_DIR")" "$INSTANCE_SLUG" "$(date +%s)" "$mode" > "$TICK_DIR/summary.txt"
   autonomy_promote "$mode"
 
   # 4. Implement, then review, per task.
   local failures=0
   while IFS= read -r t; do
     [ -n "$t" ] || continue
-    local doc="$INSTANCE/$t" role trepo round=1
-    [ "$(task_status "$doc")" = ready ] || { echo "  skipping $t (status $(task_status "$doc"))"; continue; }
+    local doc="$INSTANCE/$t" role trepo round=1 st0
+    st0="$(task_status "$doc")"
+    case "$st0" in
+      (ready) ;;
+      (in-progress|in-review|blocked)
+        # Resume and retry deliberately pick these up: a blocked task is exactly what you
+        # re-run after changing the policy it was judged against.
+        [ "$resume" = 1 ] || { echo "  skipping $t (status $st0)"; continue; } ;;
+      (*) echo "  skipping $t (status $st0)"; continue ;;
+    esac
     role="$(task_field "$doc" assignee)"
     case "$role" in ''|'~') role=lead-dev ;; esac
     role_is_known "$role" || role=lead-dev
     trepo="$(task_field "$doc" target_repo)"; trepo="${trepo##*/}"
     [ -n "$trepo" ] || trepo="$repo"
 
-    echo "── implementing $(basename "$t") ───────────────────────"
-    run_role_sync "$role" "$t" "$trepo" "Implement this task end to end." || true
+    # Design review, when the project-manager asked for one. Before implementation, because
+    # a wrong approach caught here costs a paragraph and caught after merge costs a migration.
+    local design; design="$(task_field "$doc" design_review)"
+    local arch; arch="$(task_field "$doc" arch)"
+    if [ "$design" = required ] && [ "$arch" != sound ] && [ "$st0" != in-review ]; then
+      echo "── design review of $(basename "$t") ───────────────────"
+      run_role_sync architect "$t" "$trepo" "Review the PROPOSED solution for this task before it is built (Mode A). Decide whether it is sound. Set the arch: field and write your reasoning under '## Architecture review' in # Notes." || true
+      arch="$(task_field "$doc" arch)"
+      if [ "$arch" != sound ]; then
+        echo "  arch: ${arch:-no verdict} — not implementing this until the design is settled"
+        failures=$((failures + 1))
+        continue
+      fi
+      echo "  arch: sound — proceeding"
+    fi
+
+    if [ "$st0" = in-review ]; then
+      echo "── resuming review of $(basename "$t") ─────────────────"
+    else
+      echo "── implementing $(basename "$t") ───────────────────────"
+      local verb="Implement this task end to end."
+      [ "$st0" = in-progress ] && verb="Continue this task from where it was left. Read its # Result and # Notes first, and do not redo work that is already committed."
+      # The worktree survives between runs, so it can be behind what is on the remote — a
+      # human rebasing the stack is normal. Start from the remote, not from local commits.
+      verb="$verb
+
+Your branch already exists on the remote and may have been rebased there since your last run
+(a human maintaining a stack does this). Before you touch anything: \`git fetch origin\`, then
+look at both directions. Commits only on the remote: \`git reset --hard origin/<your branch>\`
+— the remote is the truth for what was published. Commits only here (\`git log origin/<your
+branch>..HEAD\`): keep them, they are a previous attempt that never got pushed; rebase them
+onto origin/<your branch> if that moved too. Never reset away commits that exist only locally.
+Then check whether your base branch moved and rebase onto it if it did."
+      [ "$st0" = blocked ] && verb="This task was left BLOCKED. Read its # Result and # Notes first: the work may already be written, committed and pushed. Do not redo it. The policy has changed — a blocked task still gets a pull request: open it as a DRAFT with a '## Blocked on' section listing exactly what is unmet and why, move any verification that needs a deployed environment or secrets into a CI job following the conventions of the nearest existing job in that repo, then set the task in-review with the PR URL. Only stay blocked if you cannot open a PR at all."
+      run_role_sync "$role" "$t" "$trepo" "$verb" || true
+    fi
 
     while [ "$round" -le "$rounds" ]; do
       local st; st="$(task_status "$doc")"
       [ "$st" = in-review ] || break
+      # An approved verdict is a decision, not a cache to refill. Re-reviewing an approved PR
+      # on every resume spent two boxes per task and, once, talked itself out of its own
+      # approval — t2 went from approved back to changes-requested with nothing new in the
+      # diff. Re-review is what --retry is for.
+      if [ "$(task_field "$doc" qa)" = approved ] && [ "$retry" != 1 ]; then
+        echo "  qa already approved — not reviewing it again (use --retry to force a re-review)"
+        break
+      fi
       echo "── reviewing $(basename "$t") (round $round) ───────────"
       run_role_sync qa-reviewer "$t" "$trepo" "Review the open pull request on this task against its acceptance criteria. Set the qa: field." || true
       local qa; qa="$(task_field "$doc" qa)"
+      # Two values. A box that writes anything else ("pending") leaves the task in a state no
+      # gate matches: no approval, no send-back, a draft PR nobody is working. Normalise it
+      # here, where it happened, rather than at the next resume.
+      case "$qa" in
+        (approved|changes-requested) ;;
+        ("") ;;
+        (*) note "    qa wrote '$qa', which is not a verdict — recording changes-requested"
+            set_task_field "$doc" qa changes-requested
+            qa=changes-requested ;;
+      esac
       [ "$qa" = approved ] && break
       echo "  qa: ${qa:-none} — sending it back"
-      run_role_sync "$role" "$t" "$trepo" "The qa-reviewer requested changes. Address every point, then hand it back for review." || true
+      local back="The qa-reviewer requested changes. Address every point, then hand it back for review."
+      # CI is the source of truth. "A human has to run this" is where every one of these
+      # tasks stopped, and it is not a verdict — it is a job that does not exist yet. Any
+      # verdict that is not `approved` comes back here, and anything the reviewer could not
+      # check becomes CI work rather than someone's errand.
+      if [ "$qa" != changes-requested ]; then
+        back="The qa-reviewer could not verify this inside a box — it needs a deployed
+environment, a secret or a browser. That is a gap in CI, and closing it is your work, not a
+human's: wire the verification into a CI job, copying the conventions of the nearest existing
+job in that repository (same workflow file, same secret names, same triggers). If the job
+already exists and was skipped, make it run for this pull request. If it needs a secret that
+does not exist yet, add the job referencing the name it should have and list that name under
+'## Blocked on' in the PR body. Then say in the PR body which job proves which acceptance
+criterion, and hand it back for review. Never ask a human to run anything locally."
+      fi
+      run_role_sync "$role" "$t" "$trepo" "$back" || true
       round=$((round + 1))
     done
+    # "· t5 is in-review" told you nothing about why its PR is still a draft. If review rounds
+    # ran out with a verdict outstanding, that is a decision the run made — print it.
+    if [ "$round" -gt "$rounds" ] && [ "$(task_field "$doc" qa)" != approved ]; then
+      echo "  review budget spent ($rounds rounds) and qa still says $(task_field "$doc" qa) —"
+      echo "  the PR stays a draft; resume continues the same rounds, or raise --max-rounds"
+    fi
 
     # 5. Merge, when you have handed that gate over.
     local final; final="$(task_status "$doc")"
@@ -1355,12 +3446,61 @@ cmd_harness_do() {
       fi
     fi
 
+    # 6. Curate what it taught, once per task. The cataloguer was configured, given a model
+    # tier and a role file, and then never dispatched by anything — so `knowledge/` stayed at
+    # its template while every learning went to the memory tier instead. A finished task is
+    # exactly the moment its finding is still legible, and that moment was passing unused.
+    if [ "$(task_field "$doc" qa)" = approved ] \
+       && [ -z "$(task_field "$doc" catalogued)" ] \
+       && [ -f "$INSTANCE/.claude/agents/cataloguer.md" ]; then
+      echo "── cataloguing $(basename "$t") ─────────────────────────"
+      # Stamped before the box runs: a cataloguer that times out must not make every later
+      # resume re-catalogue the same task. Curation is not worth a second box.
+      set_task_field "$doc" catalogued "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      run_role_sync cataloguer "$t" "$trepo" "This task has been accepted by review. Curate what it
+established into this panel's knowledge base, following your role definition: write or update the
+document that belongs (a Finding for a decision or a gotcha, a Service/Frontend App page for a
+boundary that is now real, a Runbook for a procedure someone will repeat), and update
+\`knowledge/index.md\` so it can be found. One document is a good outcome; none is fine if the
+task taught nothing durable — say so and stop. Do not touch product code, do not touch the pull
+request, and do not restate the task." || true
+    fi
+
     final="$(task_status "$doc")"
     case "$final" in
       done) echo "  ✓ $t is done" ;;
       *)    echo "  · $t is $final"; failures=$((failures + 1)) ;;
     esac
   done <<< "$created"
+
+  # A run with no summary is a "?" row on the dashboard, which is worse than a zero.
+  local worked=0 done_n=0 blocked_n=0
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    worked=$((worked + 1))
+    case "$(task_status "$INSTANCE/$t")" in
+      (done)             done_n=$((done_n + 1)) ;;
+      (blocked|draft)    blocked_n=$((blocked_n + 1)) ;;
+    esac
+  done <<< "$created"
+  {
+    printf 'run %s\nkind do\ninstance %s\nfinished %s\nautonomy %s\n' \
+      "$(basename "$TICK_DIR")" "$INSTANCE_SLUG" "$(date +%s)" "$mode"
+    printf 'tasks %s\naccepted %s\nrejected 0\ndone %s\nblocked %s\n' \
+      "$worked" "$worked" "$done_n" "$blocked_n"
+    printf 'pending_memory %s\n' "$(command ls "$INSTANCE/.harness/pending"/*.md 2>/dev/null | wc -l | tr -d ' ')"
+  } > "$TICK_DIR/summary.txt"
+  printf '%s\n' "$(basename "$TICK_DIR")" > "$INSTANCE_STATE/last-tick"
+
+  # Another pass, if the work came back. Bounded: --passes (default 3), and each pass only
+  # runs while something is actually actionable, so a stuck task costs one attempt, not a loop.
+  if [ "$passes" -gt 1 ] && scope_actionable "$created"; then
+    echo
+    echo "── another pass (work came back for more) ───────────────"
+    cmd_harness_do "$INSTANCE" --resume ${project:+--project "$project"} ${only_task:+--task "$only_task"} \
+      --max-rounds "$rounds" --passes "$((passes - 1))" ${repo:+--repo "$repo"}
+    return $?
+  fi
 
   echo
   echo "── result ───────────────────────────────────────────────"
@@ -1494,13 +3634,36 @@ claude-box harness — role agents in boxes, over an OKF control panel
                                                        (default: $CLAUDE_BOX_ROOT/_panel)
   claude-box harness do     [<panel>] "<what you want>"   draft -> implement -> review
                                                        -> merge, driven to completion
+  claude-box harness do     --resume [--project <slug>]  continue drafted work, no
+                                                       re-drafting
   claude-box harness new    [<panel>] "<what you want>"   just draft the documents
+  claude-box harness answer [<panel>] [--project <slug>]  answer the PM's blocking
+                                                       questions, one prompt at a time
+  claude-box harness done   <task path | project path | project slug> [<panel>] [--no-pr]
+                                                       close work out yourself, from any
+                                                       state: records what every PR on it
+                                                       was at that moment, then sets done
+  claude-box harness clean  [<panel>] [--project <slug>] [-y]
+                                                       discard attempts: remove worktrees
+                                                       and branches, reset tasks to ready
+  claude-box harness delete [<panel>] --project <slug> | --task <path>
+                            | --objective <slug>
+                            [-y] [--dry-run] [--purge] [--delete-remote]
+                                                       remove the documents themselves,
+                                                       with their worktrees and branches;
+                                                       moves them to trash unless --purge
+  claude-box harness purge  [--days N | --all] [-y]    delete logs, runs and box dirs
+                                                       (auto: older than 7 days each tick)
   claude-box harness tick   [<instance>] [--dry-run]   one PM tick, then dispatch
   claude-box harness loop   [<instance>] [gap]         tick, wait, sleep, repeat (locked)
+  claude-box harness stack  [<panel>] [--project <slug>]  link dependent PRs into a stack
+  claude-box harness stop   [<panel>]                  stop the driver AND its boxes
   claude-box harness status [<instance>]               lock, in-flight, last tick, queues
   claude-box harness autonomy [gated|promote|full]     who promotes and who merges
-  claude-box harness memory [<instance>]               review pending learnings
-  claude-box harness ui     [<instance>] [--port N]    local dashboard
+  claude-box harness memory [<panel>]                  review pending learnings
+  claude-box harness memory --list                     what is in memory, and pending
+  claude-box harness memory --accept <file> | --drop <file>
+  claude-box harness ui     [<panel>] [--port N] [--actions]   local dashboard
 
   claude-box role <role> [--instance <dir>] [--task <path>] [--repo <name>]
                          [--tier <tier>] [--prompt <text>] [--detach] [--dry-run]
@@ -1518,6 +3681,13 @@ cmd_harness() {
   case "$sub" in
     init)          cmd_harness_init "$@" ;;
     new)           cmd_harness_new "$@" ;;
+    answer)        cmd_harness_answer "$@" ;;
+    done)          cmd_harness_done "$@" ;;
+    clean)         cmd_harness_clean "$@" ;;
+    delete)        cmd_harness_delete "$@" ;;
+    purge)         cmd_harness_purge "$@" ;;
+    stop)          cmd_harness_stop "$@" ;;
+    stack)         cmd_harness_stack "$@" ;;
     do)            cmd_harness_do "$@" ;;
     autonomy)      cmd_harness_autonomy "$@" ;;
     tick)          cmd_harness_tick "$@" ;;
@@ -1526,6 +3696,6 @@ cmd_harness() {
     memory)        cmd_harness_memory "$@" ;;
     ui)            cmd_harness_ui "$@" ;;
     ""|-h|--help)  harness_usage ;;
-    *)             die "unknown harness subcommand '$sub' (try: init do new tick loop status autonomy memory ui)" ;;
+    *)             die "unknown harness subcommand '$sub' (try: init do new answer done stack stop clean delete purge tick loop status autonomy memory ui)" ;;
   esac
 }

@@ -13,7 +13,7 @@ Works with **Docker** or Apple **`container`**; the runner detects which you hav
   `git`, `git-lfs`, `curl`, `ripgrep`, `jq`, `less`, `tmux`, `procps`,
   `build-essential` + `python3` (node-gyp), `openssh-client`, the GitHub CLI
   (`gh`) with the **`gh-stack`** extension, **gitleaks**, Node via **Vite+**
-  (VoidZero), pnpm via corepack, and Claude Code.
+  (VoidZero), pnpm via the Vite+ shim (corepack when present), and Claude Code.
 - **`claude-box`** — the runner. Picks an engine, starts its daemon, mounts your
   workspace, wires auth, and launches boxes (single, headless, or fanned out).
 - **`entrypoint.sh`** — container entrypoint; decides what to run, finishes the
@@ -80,10 +80,34 @@ claude-box harness ui                     # dashboard on localhost
 explicit flag — with several boxes running, killing the daemon takes all of them
 with it.
 
+## Headless seam (`headless`)
+
+One box, one prompt, one optional worktree, in the foreground, the box's exit code passed
+through. This is what an external orchestrator drives — [claude-graph](../claude-graph)
+runs its architect/coder/qa/reviewer graph through it — so that the orchestrator never
+sees a container path or an engine flag.
+
+```sh
+claude-box headless <repo> --name graph-t1-coder-1 --worktree t1 \
+    --prompt-file p.md --system-prompt-file s.md --model opus --effort high
+claude-box headless <repo> --worktree t1 --remove          # drop the tree, keep the branch
+```
+
+`--worktree <id>` creates `<mount>/.claude-box-runs/<id>` on the branch `claude-box/<id>`
+(or `--branch <name>`, fixed by the first call) in-container on the first call (same
+convention as `run`) and reuses it after; the
+command prints `worktree=`, `branch=`, `base=` and `box=` lines before the claude stream
+starts, and `base=` stays the ORIGINAL branch point even after the repo's HEAD moves.
+Prompts come from files, read on the host, so there is no quoting to get wrong. The box
+runs `claude --permission-mode bypassPermissions --output-format stream-json` with
+`IS_SANDBOX=1`, exactly like a `run` box.
+
 ## Engines (Docker or Apple `container`)
 
 Detection prefers **Docker**, falls back to Apple **`container`**; override with
-`CLAUDE_BOX_ENGINE=docker|container`. The runner starts the engine's daemon if it
+`CLAUDE_BOX_ENGINE=docker|container`. `abox` is the same runner with the engine pinned to
+Apple `container`, for a PATH that already has `claude-box` on Docker:
+`ln -s "$PWD/abox" ~/.local/bin/abox`. The runner starts the engine's daemon if it
 is down (Docker Desktop is launched and waited for).
 
 The two CLIs look alike and are not compatible, so every difference is funnelled
@@ -177,20 +201,21 @@ Mount root and working dir are decoupled:
 
 ## Harness: role agents in boxes
 
-Five roles, each running in **its own container**, driven from the host:
+Six roles, each running in **its own container**, driven from the host:
 
 | Role | Does | Tier → model | Effort |
 | --- | --- | --- | --- |
 | `project-manager` | Reconciles documents against live git/gh state, refines drafts, decides what to dispatch, reflects merges | `deep` → opus | `xhigh` |
+| `architect` | Judges whether a solution is **sound** — before it is built, and again on the PR. Verdict only; writes no product code | `deep` → opus | `xhigh` |
 | `lead-dev` | Implements features and fixes in a product repo, opens a PR | `standard` → sonnet | `high` |
 | `qa-reviewer` | Writes tests, and reviews an open PR against the task's acceptance criteria | `deep` → opus | `xhigh` |
 | `devops` | CI, deploys, images, infra, observability | `standard` → sonnet | `high` |
 | `cataloguer` | Turns merged work into knowledge-base entries | `standard` → sonnet | `medium` |
 
 Tier names map to model aliases in `instance.config.json` (`light`/`standard`/`deep`/`apex`
-→ haiku/sonnet/opus/fable), so a panel follows the latest model in each family without
-edits. Effort is passed as `--effort`: `xhigh` for the roles whose judgement you are paying
-for, `high` for implementation, `medium` for the cataloguer. It is **omitted for the
+→ haiku/sonnet/opus/fable; no role uses `apex` by default), so a panel follows the latest
+model in each family without edits. Effort is passed as `--effort`: `xhigh` for the roles
+whose judgement you are paying for, `high` for implementation, `medium` for the cataloguer. It is **omitted for the
 `light`/haiku tier**, which rejects the flag — so a role moved to `light` silently
 loses its effort setting rather than erroring. Set `fallbackModel` to add
 `--fallback-model` to every box.
@@ -225,15 +250,246 @@ It stops early, with a distinct exit code, wherever a human is genuinely require
 
 | Exit | Why it stopped | What to do |
 | --- | --- | --- |
-| `2` | the PM raised an `open_question` — nothing downstream can answer it | append ` --- <answer>` to the question line, re-run |
+| `2` | the PM raised an `open_question` — nothing downstream can answer it | it offers to ask you there and then; otherwise `harness answer` |
 | `3` | autonomy is `gated`, so promotion is yours | promote, or `harness autonomy promote` |
 | `0` | the task reached `done` | nothing |
+
+### Jira
+
+Work is mirrored into Jira when the panel asks for it. **No credential is forwarded** — the
+account's Atlassian connector is available inside every box already (`claude mcp list` shows
+`claude.ai Atlassian Rovo: ✔ Connected`), so the boxes can read and write Jira with the same
+access you have.
+
+```json
+"jira": {
+  "enabled": true,
+  "site": "your-org.atlassian.net",
+  "project": "DPT",
+  "epicIssueType": "Epic", "storyIssueType": "Story", "subtaskIssueType": "Subtask",
+  "labels": ["agent"]
+}
+```
+
+| Panel | Jira |
+| --- | --- |
+| project | **Epic**, key recorded in `jira_epic:` on `project.md` |
+| task | **Story**, key recorded in `jira:` on the task |
+| separable steps inside a task | **Sub-tasks**, only where they are genuinely separable |
+
+**One direction: the panel drives Jira.** The panel is the source of truth for what the work
+is; Jira is where the organisation tracks it. Two-way sync is how tracker integrations rot.
+
+Who does what:
+
+- The **project-manager** creates the epic and the stories, copies the **acceptance criteria
+  in full** into each ticket (a reviewer must be able to check the ticket without opening the
+  panel), records the keys, and searches for an existing issue before creating anything — a
+  duplicate ticket is worse than a missing one, because two people then think they own it.
+- The **role doing the work** keeps its own issue honest: In Progress when it starts, In
+  Review with the PR link when it opens one, a comment with the reason when it blocks. It
+  reads the available transitions first rather than guessing a status this workflow lacks,
+  and it never closes an issue or opens a second one.
+- The **project-manager reconciles every tick** — a task at `in-review` whose story still
+  says To Do is drift, and drift is what makes people stop trusting a tracker.
+
+The dashboard shows each task's key (and each project's epic) as a link straight into Jira.
+
+Nothing here is testable without a real Jira: the checks cover the plumbing — config,
+fields, links — not the MCP calls. Probe it with one cheap run before trusting it with a
+backlog.
+
+### `blocked` with green CI is a real state, not a contradiction
+
+The `qa:` verdict has two values, because **CI is the source of truth**:
+
+| `qa:` | Meaning | Next |
+| --- | --- | --- |
+| `approved` | every criterion met, with a CI run as the evidence | merge (the host does it under autonomy `full`) |
+| `changes-requested` | a defect against the criteria, or a criterion no CI job proves yet | another implementation round |
+
+There is no verdict that hands verification to a person. A criterion a box cannot check —
+needs a deployed environment, a secret, a browser — is a **CI job that does not exist yet**,
+and writing it is work like any other, so it comes back as `changes-requested` with the job
+named. The host enforces that: any verdict other than `approved` is sent back with
+instructions to wire the check into CI, copying the nearest existing job in that repository.
+If the job needs a secret nobody has granted, the job still gets written, referencing the name
+it should have, and that name is listed under `## Blocked on` in the PR body — a value waiting
+to be filled in, not an errand waiting for a human.
+
+### Objectives, and who writes them
+
+Every project gets `objectives/<slug>.md`: the goal in one line, **Why now**, **Done when** (two
+to four checkable statements), **Not doing**. The project-manager writes it while drafting and
+keeps it current; the project document points at it with `objective:`. `status: met` is a claim
+about the world, so it cites what proves each "done when" line.
+
+### The cataloguer runs when work is accepted
+
+Once `qa: approved` is on a task, the host dispatches one cataloguer box for it, stamps
+`catalogued:` on the document so it never happens twice, and lets it write into `knowledge/` —
+a Finding for a decision or a gotcha, a Service page for a boundary that is now real, a Runbook
+for a procedure someone will repeat. One document is a good outcome; none is fine when the task
+taught nothing durable. Before this, the role was configured and never dispatched, so
+`knowledge/` sat at its template while every learning went to the memory tier instead.
+
+### Rounds happen in the task document, not in the PR thread
+
+A review round is two boxes talking. The implementer reads the task document before every round,
+so the qa-reviewer's findings go in `# Review` and the architect's in `# Design review` — not as
+PR comments, and never through `gh pr review`, whose `--request-changes` and `--approve` are
+review events that notify people and change the merge state.
+
+The pull request has two agent-written surfaces: the **body**, rewritten in place each round so
+it always describes the change as it stands (including `## Blocked on`), and **one comment**,
+posted only once the change is finished, naming what proves each criterion. Four rounds of
+commenting buries the one comment a human needs under three that are already resolved.
+
+### The design gate
+
+A task whose frontmatter carries `design_review: required` is **not implemented** until the
+`architect` has judged the approach and written `arch: sound`. On `arch: changes-requested`
+it goes back to `draft` for the project-manager to rework — nothing is built. The architect
+looks for the findings that only exist before code: does this belong here, does it already
+exist elsewhere, is the boundary right, what does it couple, is it reversible, does it match
+the codebase's own conventions.
+
+The project-manager requires a review when the work **sets a precedent** — a new service or
+package, a schema or public API change, work crossing a repo boundary, a migration, a new
+dependency, a pattern the codebase does not have — and not for a bug fix or a change that
+follows an existing pattern. A gate that fires on everything is a tax that teaches everyone
+to route around it.
+
+It is also told to say when things are fine: `arch: sound` with what was verified. A reviewer
+that always finds problems gets ignored.
+
+### Reading CI honestly
+
+Two mistakes are easy here and the dashboard used to make both.
+
+**Skipped is not failed.** In a monorepo most jobs are path-filtered, so the majority of checks
+skip on any given PR — that is the system working, not a problem. A PR is judged by whether a
+check that *ran* failed, and by `mergeStateStatus` — GitHub's own answer about the repository's
+required checks — rather than by counting skips.
+
+**Every failing check counts, required or not.** A check that ran and failed is worth fixing
+whichever way branch protection is configured — the harness never filters on "required".
+`mergeStateStatus` is reported as extra context (GitHub saying *blocked*, *behind*, *dirty*), never
+as the gate.
+
+**A red check is not automatically the PR's fault.** For every failing check the dashboard asks
+whether the same check is already failing on the base branch, and splits them:
+
+- *caused by this change* — the check passes on the base, so this PR broke it. The task is
+  marked stalled with the check names.
+- *already failing on `<base>`* — somebody else's problem, reported and not treated as this
+  PR's work.
+
+The roles are told the same, because this is where an agent does real damage: it will otherwise
+"fix" code it never broke, or make a check green by skipping a test, loosening an assertion or
+disabling the job. The standards forbid all three, require reproducing a failure locally before
+guessing, and treat "it's flaky" as a claim needing two runs' evidence.
+
+### Answering a blocking question
+
+When the project-manager needs a decision only you can make, it records a numbered
+`open_questions` entry and the task stays unpromotable. `harness do` offers to ask you on
+the spot; otherwise:
+
+```sh
+claude-box harness answer                          # every open question, one prompt each
+claude-box harness answer --project <slug>         # just that project
+```
+
+Each answer is appended to its own question line — `"Q1: which region? --- eu-central-1"` —
+which is the form the project-manager folds in and clears on its next pass. Editing the
+YAML by hand works too, but the arrays are multi-line and quoted, so let the tool do it.
+
+### Closing work out yourself
+
+Nothing in the harness writes `done` on its own — even `autonomy full`, which merges, leaves
+the status alone. If you merge a PR yourself (a protected branch, a review someone else has to
+click), or you simply decide a piece of work is finished, tell the panel:
+
+```sh
+claude-box harness done projects/<slug>/tasks/t1.md    # a task, from whatever state it is in
+claude-box harness done projects/<slug>/project.md     # a whole project
+claude-box harness done <slug>                         # same project, by slug
+claude-box harness done projects/<slug>/tasks/t1.md --no-pr   # do not even ask gh
+```
+
+It never refuses on status: draft, in-progress, blocked, even cancelled can be closed out —
+that call is yours. What it does instead is **record what was true**. Every URL in the task's
+`pr:` is looked up with `gh`, and the answer goes into `# Notes` verbatim:
+
+- `4 PR(s) merged, checked against gh`
+- `NOT every PR was merged — https://…/pull/3 OPEN`
+- `no PR on this task`, or `gh not on PATH, so the merges were never checked`
+
+So a `done` can never quietly imply a merge that did not happen, which matters because `done`
+is terminal — `harness clean` keeps it. On a project it records which of its tasks were not yet
+done or cancelled. The dashboard's **mark done** button, on any task card and on any project
+row, runs exactly this command.
+
+### Resuming
+
+```sh
+claude-box harness do --resume                     # everything unfinished
+claude-box harness do --resume --project <slug>    # just that project
+claude-box harness do --resume --dry-run           # what it would pick up
+```
+
+**It keeps going while work comes back.** A review that requests changes puts a task back
+behind the cursor, so a single forward pass stranded it until someone noticed and re-ran the
+command. `--resume` now makes another pass whenever something in scope is actionable again,
+bounded by `--passes` (default 3) — so a task that keeps bouncing costs a few attempts, not a
+loop.
+
+Resume never calls the project-manager to draft, so it cannot duplicate a project — which
+re-running `harness do "<same text>"` would. It takes `ready`, `in-progress` and
+`in-review` and skips `done`, `cancelled` and `blocked`; a task already `in-progress` is
+*continued* ("read its `# Result` first, don't redo committed work") rather than restarted.
+
+**Answers are folded in first.** An answered question still occupies its `open_questions`
+entry, and the host refuses to promote a task while any entry remains — an answer can
+change the work, or cancel it. So resume runs one project-manager box to fold your answers
+into the tasks, clear the entries, and **cancel any task whose answer said to skip it**.
+Cancelled tasks then drop out of the run. Without that pass a resume would stall silently
+on every answered task.
+
+### Watching a box work
+
+Headless boxes run with `--output-format stream-json --verbose`. That is not a detail: the
+default text output prints **nothing until the run finishes**, so a seven-minute box looked
+hung and its log held a single line. The stream lands raw in the log file and
+`harness/render-log.py` turns it into something readable:
+
+```
+·   session started
+    thinking…
+→   Bash  pnpm --filter configuration-studio-v2 exec playwright install
+    ok
+→   Write  apps/configuration-studio-v2/playwright.config.ts
+»   Scaffolded the config and the login page object; running the suite now
+✓   finished: success in 512.4s, 34 turn(s), $2.9104
+```
+
+```sh
+claude-box logs -f <box>          # rendered, follows
+claude-box logs --raw <box>       # the underlying stream-json
+```
+
+The dashboard renders the same feed in its log drawer, and each in-flight card shows the
+newest action plus a running token estimate — so a working box and a stuck box no longer
+look identical.
+
+### Dashboard
 
 The only wait in the whole pipeline is CI, which runs on someone else's schedule — that
 gets a bounded poll (`CLAUDE_BOX_CI_TIMEOUT`, default 900s) and then hands off to the loop
 rather than blocking forever.
 
-### `do` versus `loop`
+#### `do` versus `loop`
 
 They are for different shapes of work, and using the wrong one is the mistake this section
 exists to prevent:
@@ -402,7 +658,14 @@ overlay's wording.
 | --- | --- | --- | --- |
 | Global | `<state>/harness/memory/` | every repo and instance | you accept a proposal |
 | Panel knowledge base | `<panel>/knowledge/` | this panel's services, findings, runbooks | the `cataloguer`, directly |
-| Repo-local | `<repo>/.harness/memory/` | one product repo | you accept a proposal |
+| Repo-scoped | `<panel>/memory/repos/<repo>/` | one product repo | you accept a proposal |
+
+Repo-scoped memory lives in the **panel**, not in the product repo. Accepting a learning must
+never modify a checkout the human did not ask us to touch — an earlier version wrote into
+`<repo>/.harness/memory/` and left a dozen untracked files in a monorepo working tree, which is
+the pollution without the sharing, since nothing ever committed them. Commit the panel to share
+learnings with a team. A repo that *does* want to publish its own learnings can still keep
+`.harness/memory/` — the harness reads it and never writes there.
 
 Every role box gets all three read-only, in that order, later tiers overriding
 earlier ones, capped at `CLAUDE_BOX_MEMORY_MAX` characters (default 8000) so memory
@@ -434,16 +697,58 @@ normal diff. **The panel's knowledge base is deliberately outside this gate** �
 worse than no index. The trade is explicit: the tier with the most churn is the
 unreviewed one.
 
+### Watching a box work
+
+Headless boxes run with `--output-format stream-json --verbose`. That is not a detail: the
+default text output prints **nothing until the run finishes**, so a seven-minute box looked
+hung and its log held a single line. The stream lands raw in the log file and
+`harness/render-log.py` turns it into something readable:
+
+```
+·   session started
+    thinking…
+→   Bash  pnpm --filter configuration-studio-v2 exec playwright install
+    ok
+→   Write  apps/configuration-studio-v2/playwright.config.ts
+»   Scaffolded the config and the login page object; running the suite now
+✓   finished: success in 512.4s, 34 turn(s), $2.9104
+```
+
+```sh
+claude-box logs -f <box>          # rendered, follows
+claude-box logs --raw <box>       # the underlying stream-json
+```
+
+The dashboard renders the same feed in its log drawer, and each in-flight card shows the
+newest action plus a running token estimate — so a working box and a stuck box no longer
+look identical.
+
 ### Dashboard
 
 ```sh
 ./claude-box harness ui <instance> --port 7777      # http://localhost:7777
 ```
 
-Live view of what the agents are doing: boxes in flight with role, task and a ticking
-elapsed counter; the task board grouped by status; per-box log tail; proposed
-learnings; refused dispatches with their reasons; and tick history with a badge when a
-promotion was reverted. It polls a read-only JSON endpoint that reads the same files
+Live view of what the agents are doing:
+
+- **Waiting on you** — every unanswered question, first, because it blocks everything else
+- **Projects** — one row each: title, repo, task counts by state, how many are waiting
+- **Board** — tasks by status; click one for its **rendered plan**: acceptance criteria as a
+  numbered list, questions with your answers highlighted, PR links with CI state,
+  dependencies, and the task document as formatted markdown (with a `raw` toggle). Task
+  documents are agent-written and the page holds an action token, so the renderer escapes
+  everything first and never inserts markup from a document — there is a test for that
+- **Boxes in flight** — role, task, a ticking elapsed counter, live log tail
+- **Logs** — every recent box, running or finished, openable; a finished box's log is
+  exactly when you want to read it
+- **Roles** — every role this panel can dispatch: what it is for, which model and effort it
+  runs on, whether it is working something right now, and what it has cost (runs, failures,
+  total, average cost and time). One table for "who exists" and "what they cost"
+- **Memory** — what is actually *in* memory, per tier (global, repo-scoped, the knowledge
+  base index), each readable in full in the drawer. Proposals sit above it with **accept**
+  and **drop** buttons when actions are enabled — acceptance routes through the same
+  `harness memory` command the terminal uses
+- Refused dispatches with reasons, and run history badging any reverted promotion It polls a read-only JSON endpoint that reads the same files
 the harness writes, so there is no second source of truth to drift.
 
 Bound to `127.0.0.1` only, no external assets, nothing published — your task titles
@@ -689,6 +994,27 @@ identity, so agent commits land attributed. Per-repo config still overrides it.
 > with unrestricted egress. The `deny` list blocks the obvious irreversible
 > commands, but if that token's reach makes you uncomfortable, launch with a
 > narrower one: `GH_TOKEN=<scoped-token> ./claude-box …`.
+
+## Why installs were slow (and are not any more)
+
+Three things were making every task pay a cold start, and the first was my own convention:
+
+- **A private per-worktree pnpm store.** The roles were told to pass
+  `--store-dir <worktree>/.pnpm-store` to avoid concurrent-install corruption. pnpm locks
+  its own store, so that guard bought nothing and cost everything: a **full cold download of
+  the monorepo's dependency tree on every single task**. Roles now use the store already
+  configured in the box — on the mount, shared, warm between runs, hardlinked into
+  `node_modules` — and are told never to pass `--store-dir`.
+- **Corepack re-downloading the repo's pinned pnpm.** `COREPACK_HOME` now lives in the
+  persisted pnpm dir, so `packageManager: pnpm@9.15.4` is fetched once per host.
+- **A two-minute command timeout inside the box**, which pushed agents into `nohup` +
+  polling gymnastics around every install. The managed settings now set
+  `BASH_DEFAULT_TIMEOUT_MS=600000` and `BASH_MAX_TIMEOUT_MS=1800000`, so a long install runs
+  inline and the agent can just read its output.
+
+Roles are also told to install the narrowest scope (`--filter <app>...`) and never to
+`git checkout -- pnpm-lock.yaml` and reinstall from scratch to tidy up — that throws away
+exactly the warm state that makes the next run fast.
 
 ## pnpm store (persistent + shared)
 

@@ -43,7 +43,7 @@ instance appears to authorise.
 ## Memory
 
 Everything under `## Memory` in your system prompt is read-only context assembled by
-the host from the global and repo-local tiers. Do not try to edit those files.
+the host from the global and repo-scoped tiers. Do not try to edit those files.
 
 When you learn something durable — a convention, a gotcha, a failure mode worth
 remembering — propose it. One file per proposal, at

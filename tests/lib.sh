@@ -32,6 +32,9 @@ setup_sandbox() {
   export CLAUDE_BOX_FAKE_STATE="$SANDBOX/fake"
   export CLAUDE_BOX_SOURCE_ONLY=1
   mkdir -p "$CLAUDE_BOX_ROOT" "$CLAUDE_BOX_STATE" "$CLAUDE_BOX_CONFIG_HOME" "$CLAUDE_BOX_FAKE_STATE"
+  # A stand-in login: the harness refuses to spend a box without one, and these tests are
+  # about control flow, not auth.
+  printf '{"fake":true}\n' > "$CLAUDE_BOX_CONFIG_HOME/.credentials.json"
   # HOME must contain the root, or the runner cannot map it to a container path.
   export HOME="$SANDBOX"
   export CLAUDE_BOX_ROOT="$SANDBOX/root"
@@ -58,7 +61,9 @@ wait_for_text() {
 
 teardown_sandbox() { [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX"; }
 
-load_runner() { . "$REPO_DIR/claude-box"; }
+# The runner sets -e for its own safety; sourcing it would make any non-zero return abort
+# the test file, and these tests deliberately exercise failure paths.
+load_runner() { . "$REPO_DIR/claude-box"; set +e; }
 
 # A minimal but realistic ai-bridge control-panel instance.
 make_instance() {

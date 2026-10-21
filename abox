@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# claude-box on Apple `container`: the same runner with the engine pinned, under a name of
+# its own, so a shell that already has `claude-box` (Docker by default) keeps both.
+# `abox <anything>` == `CLAUDE_BOX_ENGINE=container claude-box <anything>`.
+exec env CLAUDE_BOX_ENGINE=container "$(dirname "$(readlink -f "$0")")/claude-box" "$@"

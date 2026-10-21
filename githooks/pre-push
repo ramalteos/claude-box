@@ -13,8 +13,6 @@
 #   CLAUDE_BOX_ALLOW_DIRECT_PUSH=1 git push origin main
 set -uo pipefail
 
-[ "${CLAUDE_BOX_ALLOW_DIRECT_PUSH:-}" = "1" ] && exit 0
-
 remote_name="${1:-origin}"
 
 # The default branch as the remote reports it, plus the usual trunk names — a repo whose
@@ -46,6 +44,10 @@ while read -r _local_ref _local_sha remote_ref _remote_sha; do
   is_protected "$branch" && blocked="$blocked $branch"
 done
 
+if [ "${CLAUDE_BOX_ALLOW_DIRECT_PUSH:-}" = "1" ]; then
+  blocked=""
+fi
+
 if [ -n "$blocked" ]; then
   cat >&2 <<MSG
 
@@ -61,4 +63,32 @@ If you are a human who means to do this:
   CLAUDE_BOX_ALLOW_DIRECT_PUSH=1 git push $remote_name <branch>
 MSG
   exit 1
+fi
+
+# --- secrets, again, at the last gate ----------------------------------------
+# Our pre-COMMIT hook is installed globally, but a repo that sets its own core.hooksPath
+# (husky and friends) replaces it — and several of those hooks assume a developer laptop
+# (`brew install gitleaks`) and simply fail in a box. So a commit may legitimately have been
+# made with --no-verify, and this is the one gate that always runs. Scanning here means no
+# secret leaves the box regardless of what the repo's own hooks did.
+if [ "${CLAUDE_BOX_SKIP_GITLEAKS:-}" != "1" ] && command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks --help 2>&1 | grep -q '^  git '; then
+    scan="gitleaks git --no-banner --redact ."
+  else
+    scan="gitleaks detect --no-banner --redact --source ."
+  fi
+  if ! $scan >/tmp/gitleaks-prepush.log 2>&1; then
+    cat >&2 <<MSG
+
+claude-box: gitleaks found a secret in this repository — push blocked.
+
+$(tail -20 /tmp/gitleaks-prepush.log)
+
+Remove it (and rotate it if it was ever real). This check runs on push because a repo's
+own pre-commit hook can replace ours, so this is the gate that always runs.
+Bypass only if you are certain it is a false positive:
+  CLAUDE_BOX_SKIP_GITLEAKS=1 git push …
+MSG
+    exit 1
+  fi
 fi

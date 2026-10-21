@@ -7,3 +7,6 @@
 
 # Local private scope→registry mappings (see registries.npmrc.example)
 registries.npmrc
+
+# Python bytecode (harness/ui/server.py, harness/render-log.py)
+__pycache__/
