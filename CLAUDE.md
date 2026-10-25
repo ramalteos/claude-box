@@ -15,8 +15,8 @@ On top of that sits the **harness** (`harness/`): role agents — `project-manag
 box, under a real cross-session lock, with reviewed memory and a localhost dashboard. The roles,
 schema and panel template ship IN THIS REPO (`harness/roles/`, `harness/template/`);
 `claude-box harness init <dir>` stamps a panel. The document protocol is deliberately
-compatible with an ai-bridge instance, which can be used as a panel unmodified. See
-`docs/superpowers/specs/2026-08-19-claude-box-harness-design.md`.
+compatible with an ai-bridge instance, which can be used as a panel unmodified. The
+harness reference is `harness/README.md`; the runner reference is `README.md`.
 
 The repos root is `$CLAUDE_BOX_ROOT`, default `~/Documents/GitHub`, mounted at the
 same path relative to `$HOME` inside the box.

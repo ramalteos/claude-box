@@ -9,9 +9,7 @@
 # to the container engine. A role box writes a dispatch INTENT to a file; the host
 # validates it and launches the container. Mounting the engine socket into a box
 # would hand a sandboxed agent the host daemon, which is a sandbox escape rather
-# than a feature — so the intent file is the whole interface.
-#
-# See docs/superpowers/specs/2026-08-19-claude-box-harness-design.md.
+# than a feature — so the intent file is the whole interface. See harness/README.md.
 
 HARNESS_DIR="$SETUP_DIR/harness"
 # Per-box wall-clock limit. A wedged agent must not hold a dispatch slot forever.
