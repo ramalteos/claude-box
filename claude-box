@@ -340,19 +340,63 @@ seed_config() {
   # deterministic, and process frameworks are the opposite of that in this context —
   # they add planning gates a headless box cannot answer, and several of them write
   # plan/spec documents into whatever repo they are run in. That is pollution in a
-  # product repo. Opt in with CLAUDE_BOX_SEED_PLUGINS=1 when you want them.
+  # product repo. Opt in with CLAUDE_BOX_SEED_PLUGINS=1 (the sandbox config's own) or
+  # CLAUDE_BOX_SEED_PLUGINS=host (what your host ~/.claude has enabled).
   for item in settings.json CLAUDE.md agents; do
     [ -e "$CONFIG_HOME/$item" ] || continue
     [ -e "$dst/$item" ] && continue
     cp -R "$CONFIG_HOME/$item" "$dst/$item" 2>/dev/null || true
   done
-  if [ "${CLAUDE_BOX_SEED_PLUGINS:-0}" = "1" ]; then
-    for item in plugins commands skills; do
-      [ -e "$CONFIG_HOME/$item" ] || continue
-      [ -e "$dst/$item" ] && continue
-      cp -R "$CONFIG_HOME/$item" "$dst/$item" 2>/dev/null || true
-    done
-  fi
+  case "${CLAUDE_BOX_SEED_PLUGINS:-0}" in
+    1)
+      for item in plugins commands skills; do
+        [ -e "$CONFIG_HOME/$item" ] || continue
+        [ -e "$dst/$item" ] && continue
+        cp -R "$CONFIG_HOME/$item" "$dst/$item" 2>/dev/null || true
+      done ;;
+    host) seed_host_plugins "$dst" ;;
+  esac
+}
+
+# The host's plugin registry with the host's enablement. Copied, not mounted: Claude Code
+# writes into plugins/, and the registry stores absolute host paths that must point at the
+# box's config dir instead. Plugin OAuth tokens stay on the host: a refresh token rotated
+# from inside a box would log the host's copy out, so a plugin that needs one is authorised
+# in the sandbox login (the synced copy of a connector plugin usually already is).
+seed_host_plugins() {
+  local dst="$1" src="$HOME/.claude/plugins" item
+  [ -d "$src" ] || return 0
+  [ -e "$dst/plugins" ] && return 0
+  mkdir -p "$dst/plugins"
+  for item in cache marketplaces synced known_marketplaces.json installed_plugins.json; do
+    [ -e "$src/$item" ] || continue
+    cp -Rc "$src/$item" "$dst/plugins/$item" 2>/dev/null \
+      || cp -R "$src/$item" "$dst/plugins/$item" 2>/dev/null || true
+  done
+  python3 - "$dst" "$src" "$HOME/.claude/settings.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+dst, src, host_settings = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+for name in ("installed_plugins.json", "known_marketplaces.json"):
+    f = dst / "plugins" / name
+    if f.is_file():
+        f.write_text(f.read_text().replace(src, "/root/.claude/plugins"))
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+enabled = load(host_settings).get("enabledPlugins") or {}
+if enabled:
+    settings = load(dst / "settings.json")
+    settings.setdefault("enabledPlugins", {}).update(enabled)
+    (dst / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
+PY
 }
 
 # $1 = box name, $2 = "isolated" | "shared" | "none"
@@ -451,14 +495,6 @@ build_run_args() {
   # the host's value so the substitution resolves. Never created here.
   [ -n "${GITHUB_REGISTRY_ACCESS_TOKEN:-}" ] && \
     RUN_ARGS+=(-e "GITHUB_REGISTRY_ACCESS_TOKEN=$GITHUB_REGISTRY_ACCESS_TOKEN")
-
-  # Your HOST ~/.claude plugins, read-only, on request. Off by default: the host config
-  # is not the box's, that decoupling is the point of $CONFIG_HOME, and a plugin written
-  # for an interactive session can drag planning gates and plan-document writing into a
-  # headless role box. Turn it on when you specifically want a host skill in the box.
-  if [ "${CLAUDE_BOX_HOST_PLUGINS:-0}" = "1" ] && [ -d "$HOME/.claude/plugins" ]; then
-    RUN_ARGS+=(-v "$HOME/.claude/plugins:/root/.claude/plugins:ro")
-  fi
 
   # An API key, when the box is driven headlessly by something that has one.
   [ -n "${ANTHROPIC_API_KEY:-}" ] && RUN_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")

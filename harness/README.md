@@ -356,8 +356,8 @@ proposal is served.
 A box gets its own `~/.claude`, seeded from the sandbox config, not your host `~/.claude`.
 Plugins, commands and skills are not seeded by default: process frameworks add planning
 gates a headless box cannot answer and write plan documents into whatever repo they run in
-(`CLAUDE_BOX_SEED_PLUGINS=1` seeds them; `CLAUDE_BOX_HOST_PLUGINS=1` mounts the host
-plugins read-only). Stacked PRs need no skill: `gh-stack` is in the image and the
+(`CLAUDE_BOX_SEED_PLUGINS=host` copies the host's enabled plugins into each box;
+`=1` seeds the sandbox config's own). Stacked PRs need no skill: `gh-stack` is in the image and the
 workflow is in the roles. The image's hooks (secret scanning, scratch paths, no direct
 push to a protected branch) apply to every box; see the
 [runner README](../README.md#git-hooks-baked-into-the-image).

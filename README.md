@@ -129,9 +129,12 @@ names a box.
   `~/.ssh/known_hosts` is mounted read-only.
 - Git identity (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`) from the host `git config`, and `TZ`.
   The host `~/.gitconfig` itself is not mounted.
-- Host `~/.claude` plugins, commands and skills are not seeded into headless boxes
-  (`CLAUDE_BOX_SEED_PLUGINS=1` seeds them from the sandbox config;
-  `CLAUDE_BOX_HOST_PLUGINS=1` mounts the host `~/.claude/plugins` read-only).
+- Plugins, commands and skills are not seeded into headless boxes by default.
+  `CLAUDE_BOX_SEED_PLUGINS=host` copies the host's `~/.claude/plugins` registry and its
+  `enabledPlugins` into each box (paths rewritten to the box's config dir);
+  `CLAUDE_BOX_SEED_PLUGINS=1` seeds the sandbox config's own plugins, commands and
+  skills. Plugin OAuth tokens are never copied from the host: a plugin that needs one is
+  authorised in the sandbox login.
 
 ### Sizing
 
@@ -307,8 +310,7 @@ Runner:
 | `CLAUDE_BOX_NAME` | | name this box |
 | `CLAUDE_BOX_ISOLATE` | | `1`: give the interactive box its own config dir |
 | `CLAUDE_BOX_RUN_ARGS` | | extra flags for every `run` box |
-| `CLAUDE_BOX_SEED_PLUGINS` | `0` | seed plugins/commands/skills into headless boxes |
-| `CLAUDE_BOX_HOST_PLUGINS` | `0` | mount the host `~/.claude/plugins` read-only |
+| `CLAUDE_BOX_SEED_PLUGINS` | `0` | `host`: the host's enabled plugins into each box; `1`: the sandbox config's plugins/commands/skills |
 | `CLAUDE_BOX_SKIP_UPDATE` | | `1`: skip the Claude Code refresh |
 | `CLAUDE_BOX_UPDATE_TTL` | `21600` | seconds between refresh checks |
 | `CLAUDE_BOX_MEM`, `CLAUDE_BOX_CPUS`, `CLAUDE_BOX_FANOUT_MEM_PCT`, `CLAUDE_BOX_MIN_BOX_GIB` | see [Sizing](#sizing) | |
