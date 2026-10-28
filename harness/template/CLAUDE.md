@@ -58,8 +58,7 @@ tasks in the same repo at the same time.
    or be stopped; if the PR only gets opened at the end, all of that becomes invisible work
    on a branch nobody looks at. A draft PR that grows is strictly better than a perfect PR
    that never happens.
-6. **Conventional commits** (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `ci:`). No AI
-   attribution, no co-author trailers.
+6. **Conventional commits** (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `ci:`).
 
    **When a repo's own git hook cannot run in a box.** Many repos install husky hooks that
    assume a developer laptop — `brew install gitleaks`, a GUI keychain, a VPN — and they
