@@ -62,6 +62,7 @@ assert_fails "and pnpm is not called" pnpm_called
 # --- 4. --force ignores the stamp --------------------------------------------
 out="$(run_upd --force)"
 assert_ok "--force always checks" pnpm_called
+assert_contains "the global bin dir is the one on the image PATH" "$(cat "$SANDBOX/pnpm-calls.log")" "--global-bin-dir $PG/bin"
 
 # --- 5. offline with a broken install still falls back ------------------------
 : > "$SANDBOX/claude-broken"; : > "$SANDBOX/pnpm-offline"

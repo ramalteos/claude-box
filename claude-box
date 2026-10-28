@@ -390,29 +390,29 @@ resolve_config_mount() {
   #   .claude.json      — copied, because Claude Code rewrites it constantly and parallel
   #                       boxes sharing it is the collision this isolation exists to avoid
   if [ -f "$CONFIG_HOME/.credentials.json" ]; then
-    # Box names repeat between runs, so a per-box config dir outlives its box — and Claude
-    # Code, when it refreshes a token, replaces the symlink with a REGULAR file. The
-    # entrypoint deliberately never overwrites what a box already has, so that regular file
-    # froze one box on the token it happened to hold. Refresh tokens rotate: by the next run
-    # some other box had rotated it, this one's copy could no longer refresh, and the box died
-    # with "OAuth session expired and could not be refreshed" in 80ms. Carry a newer token
-    # back, then drop the copy so the entrypoint links it to the shared login again.
-    local mine="$ISOLATED_CFG/.credentials.json"
-    if [ -f "$mine" ] && [ ! -L "$mine" ]; then
-      if [ "$mine" -nt "$CONFIG_HOME/.credentials.json" ]; then
-        # Only a copy that made it back may be dropped: if the cp fails this is the newest
-        # refresh token anywhere, and the next run gets another chance to carry it.
-        if cp "$mine" "$CONFIG_HOME/.credentials.json" 2>/dev/null; then
-          note "carried a newer token back from $name"
-          rm -f "$mine"
-        else
-          note "could not carry the newer token back from $name — keeping its copy"
-        fi
+    # Claude Code, when it refreshes a token, replaces the symlink with a REGULAR file in
+    # that box's config dir, and refresh tokens rotate: the box that refreshed last holds
+    # the only valid one. Boxes named per task/role/attempt never start twice under one
+    # name, so look at EVERY box dir: carry the newest copy back to the shared login, then
+    # drop the copies so the entrypoint links them to the shared login again. A copy that
+    # could not be carried back is kept: it is the newest refresh token anywhere.
+    local f newest="" keep=""
+    for f in "$STATE_HOME"/boxes/*/claude/.credentials.json; do
+      [ -f "$f" ] && [ ! -L "$f" ] || continue
+      if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
+    done
+    if [ -n "$newest" ] && [ "$newest" -nt "$CONFIG_HOME/.credentials.json" ]; then
+      local from; from="$(basename "$(dirname "$(dirname "$newest")")")"
+      if cp "$newest" "$CONFIG_HOME/.credentials.json" 2>/dev/null; then
+        note "carried a newer token back from $from"
       else
-        rm -f "$mine"
+        note "could not carry the newer token back from $from — keeping its copy"
+        keep="$newest"
       fi
-      [ -f "$mine" ] || note "relinked $name to the shared login (it was holding its own stale copy)"
     fi
+    for f in "$STATE_HOME"/boxes/*/claude/.credentials.json; do
+      [ -f "$f" ] && [ ! -L "$f" ] && [ "$f" != "$keep" ] && rm -f "$f"
+    done
     CONFIG_ARGS+=(-v "$CONFIG_HOME:/root/.claude-host")
   else
     note "no login found in $CONFIG_HOME — run 'claude-box' once and /login before using isolated or headless boxes"

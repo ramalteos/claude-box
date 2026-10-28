@@ -104,8 +104,9 @@ Mount and working directory are separate:
 Every box has a name (`claude-box-<slug>`, shown by `ps`) and its own Claude config
 directory under the runner's state dir, seeded from the shared config (`settings.json`,
 `CLAUDE.md`, `plugins/`, `agents/`, `commands/`, `skills/`; never session state). The
-shared credentials file is bind-mounted over it, so one `/login` serves every box and a
-refreshed token is shared. The plain interactive box keeps the whole shared directory, so
+shared login is linked into it, so one `/login` serves every box; a token a box refreshes
+(refresh tokens rotate, so the last refresh is the only valid one) is carried back to the
+shared login when the next box starts. The plain interactive box keeps the whole shared directory, so
 `--resume` and history work, unless another running box already holds it; then it gets an
 isolated one and says so. `CLAUDE_BOX_ISOLATE=1` forces isolation, `CLAUDE_BOX_NAME=<name>`
 names a box.

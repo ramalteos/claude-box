@@ -66,8 +66,10 @@ echo "claude-box: updating Claude Code to latest…" >&2
 # --allow-build lets claude-code's postinstall fetch its platform binary. --store-dir
 # keeps the global install and its store on the same persisted mount (see rule 2 above).
 mkdir -p "$GLOBAL_STORE"
+# --global-bin-dir: pnpm refuses a global install unless its bin dir is on PATH, and its
+# default is $PNPM_HOME itself; the image puts $PNPM_HOME/bin on PATH.
 if pnpm add -g --allow-build=@anthropic-ai/claude-code \
-     --store-dir "$GLOBAL_STORE" \
+     --store-dir "$GLOBAL_STORE" --global-bin-dir "$PNPM_HOME/bin" \
      @anthropic-ai/claude-code@latest >&2; then
   hash -r 2>/dev/null || true
   if claude_works; then
